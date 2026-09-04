@@ -3,6 +3,7 @@ package lockedresourcecontroller
 import (
 	"context"
 	"reflect"
+	"strings"
 	"sync"
 
 	"encoding/json"
@@ -174,38 +175,58 @@ func (lor *LockedResourceReconciler) isEqual(instance *unstructured.Unstructured
 // This fixes the issue where fields with value "0" are not removed when conditionals change.
 func (lor *LockedResourceReconciler) createPatchWithNullFields(expected, actual *unstructured.Unstructured) ([]byte, error) {
 	patch := expected.DeepCopy()
-	
-	// Add null values for fields that exist in actual but not in expected
-	addNullFieldsForMissing(patch.Object, actual.Object)
-	
+
+	// Add null values for fields that exist in actual but not in expected, except where an excluded
+	// path lives: an excluded field is by definition not this reconciler's to remove, and removing
+	// its PARENT (because the template omits the parent) would remove it too.
+	addNullFieldsForMissing(patch.Object, actual.Object, "", lockedresource.NormalizeJSONPaths(lor.ExcludePaths))
+
 	// Filter out excluded paths
 	filteredPatch, err := lockedresource.FilterOutPaths(patch, lor.ExcludePaths)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return json.Marshal(filteredPatch)
 }
 
-// addNullFieldsForMissing recursively adds null values to expected map for fields
-// that exist in actual but are missing in expected.
-func addNullFieldsForMissing(expected, actual map[string]interface{}) {
+// addNullFieldsForMissing recursively adds null values to expected for fields that exist in actual
+// but are missing in expected, so a merge patch removes them. prefix is the dotted path of the maps
+// being compared (".spec" for the spec map) and excluded the normalized excluded paths: a key is
+// left alone when an excluded path is that key or lies underneath it.
+func addNullFieldsForMissing(expected, actual map[string]interface{}, prefix string, excluded []string) {
 	for key, actualValue := range actual {
 		// Skip metadata and status as they're typically excluded
 		if key == "metadata" || key == "status" {
 			continue
 		}
-		
+		path := prefix + "." + key
+		if pathContainsExcluded(path, excluded) {
+			if _, exists := expected[key]; !exists {
+				continue
+			}
+		}
+
 		if _, exists := expected[key]; !exists {
 			// Field missing in expected - set to null to remove it
 			expected[key] = nil
 		} else if actualMap, ok := actualValue.(map[string]interface{}); ok {
 			if expectedMap, ok := expected[key].(map[string]interface{}); ok {
 				// Both are maps - recurse
-				addNullFieldsForMissing(expectedMap, actualMap)
+				addNullFieldsForMissing(expectedMap, actualMap, path, excluded)
 			}
 		}
 	}
+}
+
+// pathContainsExcluded is true when an excluded path equals path or starts underneath it.
+func pathContainsExcluded(path string, excluded []string) bool {
+	for _, e := range excluded {
+		if e == path || strings.HasPrefix(e, path+".") {
+			return true
+		}
+	}
+	return false
 }
 
 func (lor *LockedResourceReconciler) logDiff(instance *unstructured.Unstructured) string {

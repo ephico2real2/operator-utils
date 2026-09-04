@@ -2,6 +2,7 @@ package lockedresource
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	jsonpatch "github.com/evanphx/json-patch"
@@ -28,7 +29,11 @@ func FilterOutPaths(obj *unstructured.Unstructured, jsonPaths []string) (*unstru
 		}
 		doc1, err := decodedPatch.Apply(doc)
 		if err != nil {
-			if strings.Contains(err.Error(), "Unable to remove nonexistent key") || strings.Contains(err.Error(), "remove operation does not apply: doc is missing path") {
+			// An excluded path that the document does not have (a missing key, or an array index past
+			// the end) is not an error: there is nothing to exclude.
+			if strings.Contains(err.Error(), "Unable to remove nonexistent key") ||
+				strings.Contains(err.Error(), "remove operation does not apply: doc is missing path") ||
+				strings.Contains(err.Error(), "Unable to access invalid index") {
 				continue
 			}
 			innerlog.Error(err, "unable to apply", "patch", patch, "to json", string(doc))
@@ -74,16 +79,44 @@ func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 	return result, nil
 }
 
+var indexedSegment = regexp.MustCompile(`\[\s*(?:(\d+)|'([^']*)'|"([^"]*)")\s*\]`)
+
+// getMergePathFromJSONPath turns a dotted JSON path (".spec.replicas", ".rules[0]", "$.data['a.b']")
+// into the RFC 6901 JSON pointer a remove operation needs ("/spec/replicas", "/rules/0", "/data/a.b").
+// The previous conversion dropped the last two characters of any path ending in "]", so ".rules[0]"
+// became "/rules/" (an error on every reconcile) and ".rules[10]" became "/rules/1" (the wrong
+// element removed silently).
 func getMergePathFromJSONPath(jsonPath string) string {
-	//remove "$" if present
 	jsonPath = strings.TrimPrefix(jsonPath, "$")
-	// convert "[" and "]" to "."
-	if strings.HasSuffix(jsonPath, "]") {
-		jsonPath = jsonPath[:len(jsonPath)-2]
+	// [n] and ['key'] / ["key"] become dotted segments; a bracketed key may itself contain dots or
+	// slashes, so it is escaped per RFC 6901 before the dots are turned into separators.
+	jsonPath = indexedSegment.ReplaceAllStringFunc(jsonPath, func(m string) string {
+		sub := indexedSegment.FindStringSubmatch(m)
+		seg := sub[1]
+		if seg == "" {
+			seg = sub[2]
+			if seg == "" {
+				seg = sub[3]
+			}
+			seg = strings.NewReplacer("~", "~0", "/", "~1", ".", "\x00").Replace(seg)
+		}
+		return "." + seg
+	})
+	pointer := strings.ReplaceAll(strings.TrimSuffix(jsonPath, "."), ".", "/")
+	if !strings.HasPrefix(pointer, "/") {
+		pointer = "/" + pointer
 	}
-	jsonPath = strings.ReplaceAll(jsonPath, "[", ".")
-	jsonPath = strings.ReplaceAll(jsonPath, "]", ".")
-	// convert "." to "/"
-	jsonPath = strings.ReplaceAll(jsonPath, ".", "/")
-	return jsonPath
+	// Restore the dots that belonged to bracketed keys.
+	return strings.ReplaceAll(pointer, "\x00", ".")
+}
+
+// NormalizeJSONPaths rewrites excluded paths into the dotted form the null-field logic compares
+// against: no leading "$", indexes and bracketed keys as ".segment", so ".rules[0]" and "$.rules.0"
+// are the same path.
+func NormalizeJSONPaths(jsonPaths []string) []string {
+	out := make([]string, 0, len(jsonPaths))
+	for _, jp := range jsonPaths {
+		out = append(out, strings.ReplaceAll(getMergePathFromJSONPath(jp), "/", "."))
+	}
+	return out
 }

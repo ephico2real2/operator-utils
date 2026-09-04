@@ -3,6 +3,7 @@ package lockedresource
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"text/template"
 
 	"github.com/go-logr/logr"
@@ -69,7 +70,17 @@ func GetLockedResources(resources []utilsapi.LockedResource) ([]LockedResource, 
 	return lockedResources, nil
 }
 
-var templates = map[string]*template.Template{}
+// templates caches parsed templates. It is read and written from every controller that renders
+// through this package, concurrently, so it must be a sync.Map: the plain map it replaced was a
+// data race and, under load at operator start, a fatal "concurrent map writes". The key includes
+// the rest config, because the FuncMap (the lookup function in particular) is bound at parse time;
+// a text parsed once with one config must not be served to a caller with another.
+var templates sync.Map
+
+type templateKey struct {
+	text   string
+	config *rest.Config
+}
 
 // GetLockedResourcesFromTemplates Keep backwards compatability with existing consumers
 func GetLockedResourcesFromTemplates(resources []utilsapi.LockedResourceTemplate, params interface{}) ([]LockedResource, error) {
@@ -105,17 +116,18 @@ func GetLockedResourcesFromTemplatesWithRestConfig(resources []utilsapi.LockedRe
 }
 
 func getTemplate(resource *utilsapi.LockedResourceTemplate, config *rest.Config, logger logr.Logger) (*template.Template, error) {
-	tmpl, ok := templates[resource.ObjectTemplate]
-	var err error
-	if !ok {
-		tmpl, err = template.New(resource.ObjectTemplate).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(resource.ObjectTemplate)
-		if err != nil {
-			innerlog.Error(err, "unable to parse", "template", resource.ObjectTemplate)
-			return nil, err
-		}
-		templates[resource.ObjectTemplate] = tmpl
+	key := templateKey{text: resource.ObjectTemplate, config: config}
+	if cached, ok := templates.Load(key); ok {
+		return cached.(*template.Template), nil
 	}
-	return tmpl, nil
+	tmpl, err := template.New(resource.ObjectTemplate).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(resource.ObjectTemplate)
+	if err != nil {
+		innerlog.Error(err, "unable to parse", "template", resource.ObjectTemplate)
+		return nil, err
+	}
+	// Two goroutines may parse the same text at once; both results are equivalent, keep the first.
+	actual, _ := templates.LoadOrStore(key, tmpl)
+	return actual.(*template.Template), nil
 }
 
 // DefaultExcludedPaths represents paths that are exlcuded by default in all resources
