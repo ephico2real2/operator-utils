@@ -66,6 +66,9 @@ var negativeIndexSegment = regexp.MustCompile(`/-\d+(/|$)`)
 func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 	result := [][]byte{}
 	for _, jsonPath := range jsonPaths {
+		if err := malformedPath(jsonPath); err != nil {
+			return [][]byte{}, err
+		}
 		pointer := getMergePathFromJSONPath(jsonPath)
 		// json-patch accepts a negative index (counting from the end) and reports one that is out
 		// of range with the same text as a past-the-end index. An excluded path is a fixed
@@ -91,6 +94,22 @@ func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 }
 
 var indexedSegment = regexp.MustCompile(`\[\s*(?:(-?\d+)|'([^']*)'|"([^"]*)")\s*\]`)
+
+// malformedPath reports an excluded path that cannot name a field: a bracket that is not a complete
+// [n], ['key'] or ["key"] expression, or an empty segment (a trailing dot, or two dots in a row).
+// Measured in review before this check: ".data[" removed nothing, silently, and ".data." removed all
+// of "data" because a trailing dot was trimmed. A typo in an excluded path must be reported, not
+// retargeted. The lone root path "." (or "$") is left alone; json-patch rejects it on its own.
+func malformedPath(jsonPath string) error {
+	stripped := indexedSegment.ReplaceAllString(strings.TrimPrefix(jsonPath, "$"), "")
+	if strings.ContainsAny(stripped, "[]") {
+		return fmt.Errorf("excluded path %q has a malformed bracket expression; use [n], ['key'] or [\"key\"]", jsonPath)
+	}
+	if len(stripped) > 1 && (strings.HasSuffix(stripped, ".") || strings.Contains(stripped, "..")) {
+		return fmt.Errorf("excluded path %q has an empty segment", jsonPath)
+	}
+	return nil
+}
 
 // getMergePathFromJSONPath turns a dotted JSON path (".spec.replicas", ".rules[0]", "$.data['a.b']")
 // into the RFC 6901 JSON pointer a remove operation needs ("/spec/replicas", "/rules/0", "/data/a.b").
@@ -118,7 +137,7 @@ func getMergePathFromJSONPath(jsonPath string) string {
 		}
 		return "." + seg
 	})
-	pointer := strings.ReplaceAll(strings.TrimSuffix(jsonPath, "."), ".", "/")
+	pointer := strings.ReplaceAll(jsonPath, ".", "/")
 	if rooted && !strings.HasPrefix(pointer, "/") {
 		pointer = "/" + pointer
 	}

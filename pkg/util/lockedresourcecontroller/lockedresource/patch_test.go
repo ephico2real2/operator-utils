@@ -151,3 +151,26 @@ func TestGetMergePathFromJSONPath_UnrootedStaysUnrooted(t *testing.T) {
 		t.Error("unrooted spec.replicas must remain a no-op as before")
 	}
 }
+
+// A typo in an excluded path is reported, not retargeted: before this check ".data." removed all of
+// "data" and ".data[" removed nothing, both silently (measured in review).
+func TestFilterOutPaths_MalformedPathIsAnError(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"key": "value", "a.b": "dotted"}}}
+	for _, path := range []string{".data.", ".data[", ".data[]", ".data..key", "$.data[key]", ".data['a.b']."} {
+		_, err := FilterOutPaths(obj, []string{path})
+		if err == nil || !(strings.Contains(err.Error(), "malformed bracket") || strings.Contains(err.Error(), "empty segment")) {
+			t.Errorf("%q must be reported as malformed, got %v", path, err)
+		}
+	}
+	// well-formed spellings, including a quoted key that contains a dot, still work
+	for _, path := range []string{".data.key", "$.data.key", ".data['a.b']", ".data[\"a.b\"]", "/data/key"} {
+		out, err := FilterOutPaths(obj, []string{path})
+		if err != nil {
+			t.Errorf("%q is well formed, got %v", path, err)
+			continue
+		}
+		if data := out.Object["data"].(map[string]interface{}); len(data) != 1 {
+			t.Errorf("%q must remove exactly one key, got %v", path, data)
+		}
+	}
+}
