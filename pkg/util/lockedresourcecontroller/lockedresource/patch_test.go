@@ -125,10 +125,22 @@ func TestGetTemplate_KeyIsConfigMaterialNotPointer(t *testing.T) {
 
 func TestFilterOutPaths_NegativeIndexIsAnError(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "Role", "rules": []interface{}{map[string]interface{}{"id": 0}, map[string]interface{}{"id": 1}}}}
-	for _, path := range []string{".rules.-2", ".rules[-1]", ".rules.-1.id"} {
+	for _, path := range []string{".rules.-2", ".rules[-1]", ".rules.-1.id", "$.rules[ -1 ]", "/rules/-1"} {
 		_, err := FilterOutPaths(obj, []string{path})
 		if err == nil || !strings.Contains(err.Error(), "negative index") {
 			t.Errorf("%q: a negative index is a misconfiguration and must be reported as such, got %v", path, err)
+		}
+	}
+	// a quoted key that merely looks like a negative index is a key (measured: it was rejected before)
+	keyed := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"-1": "v", "x.-1": "w", "keep": "k"}}}
+	for _, path := range []string{".data['-1']", `.data["-1"]`, ".data['x.-1']"} {
+		out, err := FilterOutPaths(keyed, []string{path})
+		if err != nil {
+			t.Errorf("%q names a key, got %v", path, err)
+			continue
+		}
+		if data := out.Object["data"].(map[string]interface{}); len(data) != 2 {
+			t.Errorf("%q must remove exactly its key, got %v", path, data)
 		}
 	}
 	// a non-negative past-the-end index stays a no-op
@@ -156,7 +168,7 @@ func TestGetMergePathFromJSONPath_UnrootedStaysUnrooted(t *testing.T) {
 // "data" and ".data[" removed nothing, both silently (measured in review).
 func TestFilterOutPaths_MalformedPathIsAnError(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"key": "value", "a.b": "dotted"}}}
-	for _, path := range []string{".data.", ".data[", ".data[]", ".data..key", "$.data[key]", ".data['a.b']."} {
+	for _, path := range []string{".data.", ".data[", ".data[]", ".data..key", "$.data[key]", ".data['a.b'].", ".data[0"} {
 		_, err := FilterOutPaths(obj, []string{path})
 		if err == nil || !(strings.Contains(err.Error(), "malformed bracket") || strings.Contains(err.Error(), "empty segment")) {
 			t.Errorf("%q must be reported as malformed, got %v", path, err)

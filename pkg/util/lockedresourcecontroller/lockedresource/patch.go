@@ -61,22 +61,13 @@ type Patch struct {
 	Path      string `json:"path"`
 }
 
-var negativeIndexSegment = regexp.MustCompile(`/-\d+(/|$)`)
-
 func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 	result := [][]byte{}
 	for _, jsonPath := range jsonPaths {
-		if err := malformedPath(jsonPath); err != nil {
+		if err := validatePath(jsonPath); err != nil {
 			return [][]byte{}, err
 		}
 		pointer := getMergePathFromJSONPath(jsonPath)
-		// json-patch accepts a negative index (counting from the end) and reports one that is out
-		// of range with the same text as a past-the-end index. An excluded path is a fixed
-		// location, never "the last element", so a negative index is a misconfiguration to report,
-		// not a missing element to ignore.
-		if negativeIndexSegment.MatchString(pointer) {
-			return [][]byte{}, fmt.Errorf("excluded path %q has a negative index; indexes count from 0", jsonPath)
-		}
 		patch := []Patch{
 			{
 				Operation: "remove",
@@ -95,13 +86,28 @@ func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 
 var indexedSegment = regexp.MustCompile(`\[\s*(?:(-?\d+)|'([^']*)'|"([^"]*)")\s*\]`)
 
-// malformedPath reports an excluded path that cannot name a field: a bracket that is not a complete
-// [n], ['key'] or ["key"] expression, or an empty segment (a trailing dot, or two dots in a row).
-// Measured in review before this check: ".data[" removed nothing, silently, and ".data." removed all
-// of "data" because a trailing dot was trimmed. A typo in an excluded path must be reported, not
-// retargeted. The lone root path "." (or "$") is left alone; json-patch rejects it on its own.
-func malformedPath(jsonPath string) error {
-	stripped := indexedSegment.ReplaceAllString(strings.TrimPrefix(jsonPath, "$"), "")
+// A quoted key is data, whatever it contains; it is removed before the path's own syntax is checked.
+var quotedSegment = regexp.MustCompile(`\[\s*(?:'[^']*'|"[^"]*")\s*\]`)
+
+// A negative index in any spelling: "[-1]", ".rules.-1", "/rules/-1".
+var negativeIndex = regexp.MustCompile(`\[\s*-\d+\s*\]|(?:^|[./])-\d+(?:[./\[]|$)`)
+
+// validatePath reports an excluded path that cannot name a fixed location:
+//   - a negative index: json-patch would count it from the end and report an out-of-range one with
+//     the same text as a past-the-end index, so it would be silently ignored;
+//   - a bracket that is not a complete [n], ['key'] or ["key"] expression;
+//   - an empty segment (a trailing dot, or two dots in a row).
+//
+// Measured in review before these checks: ".data[" removed nothing, silently, and ".data." removed
+// all of "data" because a trailing dot was trimmed. A typo in an excluded path must be reported, not
+// retargeted. A quoted key that merely looks like a negative index (".data['-1']") is a key. The lone
+// root path "." (or "$") is left alone; json-patch rejects it on its own.
+func validatePath(jsonPath string) error {
+	unquoted := quotedSegment.ReplaceAllString(strings.TrimPrefix(jsonPath, "$"), "")
+	if negativeIndex.MatchString(unquoted) {
+		return fmt.Errorf("excluded path %q has a negative index; indexes count from 0", jsonPath)
+	}
+	stripped := indexedSegment.ReplaceAllString(unquoted, "")
 	if strings.ContainsAny(stripped, "[]") {
 		return fmt.Errorf("excluded path %q has a malformed bracket expression; use [n], ['key'] or [\"key\"]", jsonPath)
 	}
