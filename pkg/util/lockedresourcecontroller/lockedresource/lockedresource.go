@@ -3,6 +3,7 @@ package lockedresource
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -78,8 +79,29 @@ func GetLockedResources(resources []utilsapi.LockedResource) ([]LockedResource, 
 var templates sync.Map
 
 type templateKey struct {
-	text   string
-	config *rest.Config
+	text      string
+	configKey string
+}
+
+// restConfigCacheKey identifies a rest config by the material that changes what `lookup` would
+// see, not by pointer: callers that build or copy a config per reconcile would otherwise add an
+// entry per call and grow the cache without bound (measured: 50 calls, 50 entries).
+func restConfigCacheKey(config *rest.Config) string {
+	if config == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		config.Host,
+		config.APIPath,
+		config.Username,
+		config.BearerToken,
+		config.BearerTokenFile,
+		string(config.CAData),
+		config.CAFile,
+		string(config.CertData),
+		config.CertFile,
+		config.Impersonate.UserName,
+	}, "\x00")
 }
 
 // GetLockedResourcesFromTemplates Keep backwards compatability with existing consumers
@@ -116,7 +138,7 @@ func GetLockedResourcesFromTemplatesWithRestConfig(resources []utilsapi.LockedRe
 }
 
 func getTemplate(resource *utilsapi.LockedResourceTemplate, config *rest.Config, logger logr.Logger) (*template.Template, error) {
-	key := templateKey{text: resource.ObjectTemplate, config: config}
+	key := templateKey{text: resource.ObjectTemplate, configKey: restConfigCacheKey(config)}
 	if cached, ok := templates.Load(key); ok {
 		return cached.(*template.Template), nil
 	}

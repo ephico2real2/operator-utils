@@ -2,6 +2,7 @@ package lockedresource
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -60,13 +61,23 @@ type Patch struct {
 	Path      string `json:"path"`
 }
 
+var negativeIndexSegment = regexp.MustCompile(`/-\d+(/|$)`)
+
 func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 	result := [][]byte{}
 	for _, jsonPath := range jsonPaths {
+		pointer := getMergePathFromJSONPath(jsonPath)
+		// json-patch accepts a negative index (counting from the end) and reports one that is out
+		// of range with the same text as a past-the-end index. An excluded path is a fixed
+		// location, never "the last element", so a negative index is a misconfiguration to report,
+		// not a missing element to ignore.
+		if negativeIndexSegment.MatchString(pointer) {
+			return [][]byte{}, fmt.Errorf("excluded path %q has a negative index; indexes count from 0", jsonPath)
+		}
 		patch := []Patch{
 			{
 				Operation: "remove",
-				Path:      getMergePathFromJSONPath(jsonPath),
+				Path:      pointer,
 			},
 		}
 		mpatch, err := json.Marshal(patch)
@@ -79,7 +90,7 @@ func createPatchesFromJSONPaths(jsonPaths []string) ([][]byte, error) {
 	return result, nil
 }
 
-var indexedSegment = regexp.MustCompile(`\[\s*(?:(\d+)|'([^']*)'|"([^"]*)")\s*\]`)
+var indexedSegment = regexp.MustCompile(`\[\s*(?:(-?\d+)|'([^']*)'|"([^"]*)")\s*\]`)
 
 // getMergePathFromJSONPath turns a dotted JSON path (".spec.replicas", ".rules[0]", "$.data['a.b']")
 // into the RFC 6901 JSON pointer a remove operation needs ("/spec/replicas", "/rules/0", "/data/a.b").
@@ -87,6 +98,11 @@ var indexedSegment = regexp.MustCompile(`\[\s*(?:(\d+)|'([^']*)'|"([^"]*)")\s*\]
 // became "/rules/" (an error on every reconcile) and ".rules[10]" became "/rules/1" (the wrong
 // element removed silently).
 func getMergePathFromJSONPath(jsonPath string) string {
+	// Only a path that names the root (".x" or "$.x") gets the root slash. Before the index fix an
+	// unrooted "spec.replicas" produced "spec/replicas", which json-patch treated as a no-op; keeping
+	// that (rather than silently turning it into "/spec/replicas") preserves what existing callers
+	// observed. The rooted spelling is the documented one.
+	rooted := strings.HasPrefix(jsonPath, "$") || strings.HasPrefix(jsonPath, ".")
 	jsonPath = strings.TrimPrefix(jsonPath, "$")
 	// [n] and ['key'] / ["key"] become dotted segments; a bracketed key may itself contain dots or
 	// slashes, so it is escaped per RFC 6901 before the dots are turned into separators.
@@ -103,7 +119,7 @@ func getMergePathFromJSONPath(jsonPath string) string {
 		return "." + seg
 	})
 	pointer := strings.ReplaceAll(strings.TrimSuffix(jsonPath, "."), ".", "/")
-	if !strings.HasPrefix(pointer, "/") {
+	if rooted && !strings.HasPrefix(pointer, "/") {
 		pointer = "/" + pointer
 	}
 	// Restore the dots that belonged to bracketed keys.

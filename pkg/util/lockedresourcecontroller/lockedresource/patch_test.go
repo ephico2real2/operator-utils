@@ -2,6 +2,7 @@ package lockedresource
 
 import (
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"text/template"
@@ -70,6 +71,7 @@ func TestFilterOutPaths_IndexedPathRemovesTheRightElement(t *testing.T) {
 // The parse cache is shared by every controller in the process; it must survive concurrent use and
 // must not hand a template parsed with one rest config to a caller with another.
 func TestGetTemplate_ConcurrentAndKeyedByConfig(t *testing.T) {
+	templates = sync.Map{} // the cache is process-global; count only what this test inserts
 	cfgA, cfgB := &rest.Config{Host: "https://a"}, &rest.Config{Host: "https://b"}
 	texts := []string{"a: 1\n", "b: 2\n", "c: {{ .Name }}\n", "d: 4\n"}
 	var wg sync.WaitGroup
@@ -87,8 +89,8 @@ func TestGetTemplate_ConcurrentAndKeyedByConfig(t *testing.T) {
 		}
 	}
 	wg.Wait()
-	a, _ := templates.Load(templateKey{text: texts[0], config: cfgA})
-	b, _ := templates.Load(templateKey{text: texts[0], config: cfgB})
+	a, _ := templates.Load(templateKey{text: texts[0], configKey: restConfigCacheKey(cfgA)})
+	b, _ := templates.Load(templateKey{text: texts[0], configKey: restConfigCacheKey(cfgB)})
 	if a == nil || b == nil || a.(*template.Template) == b.(*template.Template) {
 		t.Errorf("the same text must be cached separately per rest config")
 	}
@@ -96,5 +98,56 @@ func TestGetTemplate_ConcurrentAndKeyedByConfig(t *testing.T) {
 	templates.Range(func(_, _ any) bool { entries++; return true })
 	if entries != len(texts)*3 {
 		t.Errorf("expected %d cache entries (texts x configs), got %d", len(texts)*3, entries)
+	}
+}
+
+// A caller that builds a fresh *rest.Config per call (rest.CopyConfig, a literal) must not add a
+// cache entry per call: the key is the config's material, not its address.
+func TestGetTemplate_KeyIsConfigMaterialNotPointer(t *testing.T) {
+	templates = sync.Map{}
+	const text = "kind: ConfigMap\n"
+	for i := 0; i < 50; i++ {
+		if _, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, &rest.Config{Host: "https://same"}, innerlog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, nil, innerlog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := 0
+	templates.Range(func(_, _ any) bool { entries++; return true })
+	if entries != 2 {
+		t.Errorf("expected one entry for the identical configs and one for nil, got %d", entries)
+	}
+}
+
+func TestFilterOutPaths_NegativeIndexIsAnError(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "Role", "rules": []interface{}{map[string]interface{}{"id": 0}, map[string]interface{}{"id": 1}}}}
+	for _, path := range []string{".rules.-2", ".rules[-1]", ".rules.-1.id"} {
+		_, err := FilterOutPaths(obj, []string{path})
+		if err == nil || !strings.Contains(err.Error(), "negative index") {
+			t.Errorf("%q: a negative index is a misconfiguration and must be reported as such, got %v", path, err)
+		}
+	}
+	// a non-negative past-the-end index stays a no-op
+	if _, err := FilterOutPaths(obj, []string{".rules[5]"}); err != nil {
+		t.Errorf("past-the-end index must be ignored, got %v", err)
+	}
+}
+
+// An unrooted path kept its pre-fix meaning (no-op); only ".x" and "$.x" name the root.
+func TestGetMergePathFromJSONPath_UnrootedStaysUnrooted(t *testing.T) {
+	if got := getMergePathFromJSONPath("spec.replicas"); got != "spec/replicas" {
+		t.Errorf("unrooted path must stay unrooted, got %q", got)
+	}
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "Deployment", "spec": map[string]interface{}{"replicas": int64(3)}}}
+	out, err := FilterOutPaths(obj, []string{"spec.replicas"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out.Object["spec"].(map[string]interface{})["replicas"]; !ok {
+		t.Error("unrooted spec.replicas must remain a no-op as before")
 	}
 }
