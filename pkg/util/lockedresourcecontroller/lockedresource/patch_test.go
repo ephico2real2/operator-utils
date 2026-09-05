@@ -330,3 +330,17 @@ func TestFieldPath(t *testing.T) {
 		}
 	}
 }
+
+// The excluded paths are part of a locked resource's identity, in any order.
+func TestGetKey_IncludesExcludedPaths(t *testing.T) {
+	obj := unstructured.Unstructured{Object: map[string]interface{}{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]interface{}{"name": "x"}}}
+	a := LockedResource{Unstructured: obj, ExcludedPaths: []string{".metadata", ".status"}}
+	b := LockedResource{Unstructured: obj, ExcludedPaths: []string{".status", ".metadata"}}
+	c := LockedResource{Unstructured: obj, ExcludedPaths: []string{".status"}}
+	if a.GetKey() != b.GetKey() {
+		t.Error("the same paths in another order are the same resource")
+	}
+	if a.GetKey() == c.GetKey() {
+		t.Error("different excluded paths are a different locked resource: the enforcer must restart its reconciler")
+	}
+}

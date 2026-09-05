@@ -3,6 +3,8 @@ package lockedresource
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -37,14 +39,19 @@ func AsListOfUnstructured(lockedResources []LockedResource) []unstructured.Unstr
 	return unstructuredList
 }
 
-// GetKey returns the marshalled resource
+// GetKey identifies the resource for set comparisons: the marshalled object AND its excluded paths.
+// The enforcer restarts a reconciler only for a resource whose key changed; with the object alone
+// as the key, editing a template's excludedPaths on the CR changed nothing until the operator
+// restarted (measured: a reconciler kept excluding `.metadata` after the CR stopped listing it).
 func (lr *LockedResource) GetKey() string {
 	bb, err := lr.Unstructured.MarshalJSON()
 	if err != nil {
 		innerlog.Error(err, "unable to marshall", "unstructured", lr.Unstructured)
 		panic(err)
 	}
-	return string(bb)
+	paths := append([]string(nil), lr.ExcludedPaths...)
+	sort.Strings(paths)
+	return string(bb) + "\x00" + strings.Join(paths, "\x00")
 }
 
 // GetLockedResources turns an array of Resources as read from an API into an array of LockedResources, usable by the LockedResourceManager
