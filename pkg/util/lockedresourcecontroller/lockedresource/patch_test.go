@@ -302,3 +302,31 @@ func TestFilterOutPaths_RootQuotedKey(t *testing.T) {
 		t.Errorf("must remove root and keep the rest, got %v", out.Object)
 	}
 }
+
+// FieldPath hands the excluded path to callers that search a managedFields set: unescaped
+// segments, indexes as written, unrooted and root-only paths as no-ops, malformed paths reported.
+func TestFieldPath(t *testing.T) {
+	cases := map[string][]string{
+		".spec.replicas":        {"spec", "replicas"},
+		"$.rules[0].verbs":      {"rules", "0", "verbs"},
+		`.data["x/y"]`:          {"data", "x/y"},
+		".data['a.b']":          {"data", "a.b"},
+		"/metadata/labels/a~1b": {"metadata", "labels", "a/b"},
+		"spec.replicas":         nil,
+	}
+	for in, want := range cases {
+		got, err := FieldPath(in)
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%q -> %v, want %v", in, got, want)
+		}
+	}
+	for _, in := range []string{".rules[-1]", ".data[", "$."} {
+		if _, err := FieldPath(in); err == nil {
+			t.Errorf("%q must be reported as malformed", in)
+		}
+	}
+}

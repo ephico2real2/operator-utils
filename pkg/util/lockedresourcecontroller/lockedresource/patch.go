@@ -187,3 +187,21 @@ func NormalizeJSONPaths(jsonPaths []string) []string {
 	}
 	return out
 }
+
+// FieldPath returns an excluded path as the unescaped segments of its RFC 6901 pointer, for a
+// caller that must find the path in a managedFields set rather than in a document. An index is
+// returned as written. An unrooted path, a no-op for FilterOutPaths, is a no-op here too (nil).
+func FieldPath(jsonPath string) ([]string, error) {
+	if err := validatePath(jsonPath); err != nil {
+		return nil, err
+	}
+	pointer := getMergePathFromJSONPath(jsonPath)
+	if !strings.HasPrefix(pointer, "/") || pointer == "/" {
+		return nil, nil
+	}
+	segments := strings.Split(pointer[1:], "/")
+	for i, segment := range segments {
+		segments[i] = strings.NewReplacer("~1", "/", "~0", "~").Replace(segment)
+	}
+	return segments, nil
+}
