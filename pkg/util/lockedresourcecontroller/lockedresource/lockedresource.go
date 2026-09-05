@@ -3,6 +3,7 @@ package lockedresource
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"text/template"
 
 	"github.com/go-logr/logr"
@@ -69,7 +70,15 @@ func GetLockedResources(resources []utilsapi.LockedResource) ([]LockedResource, 
 	return lockedResources, nil
 }
 
-var templates = map[string]*template.Template{}
+// templates caches parsed templates by text. It is read and written from every controller that
+// renders through this package, concurrently, so it must be a sync.Map: the plain map it replaced
+// was a data race and, under load at operator start, a fatal "concurrent map writes". A cached
+// entry is a parsed base that is never executed: the FuncMap (lookup in particular) closes over a
+// rest config, so getTemplate clones the base and rebinds the caller's functions on every call.
+// Keying the cache by config material was tried and shown incomplete in review: Password, TLS
+// settings, impersonation groups, exec and auth providers, proxy and transport all reach lookup
+// and cannot all be fingerprinted, and a pointer key grew one entry per copied config.
+var templates sync.Map // map[string]*template.Template
 
 // GetLockedResourcesFromTemplates Keep backwards compatability with existing consumers
 func GetLockedResourcesFromTemplates(resources []utilsapi.LockedResourceTemplate, params interface{}) ([]LockedResource, error) {
@@ -105,17 +114,25 @@ func GetLockedResourcesFromTemplatesWithRestConfig(resources []utilsapi.LockedRe
 }
 
 func getTemplate(resource *utilsapi.LockedResourceTemplate, config *rest.Config, logger logr.Logger) (*template.Template, error) {
-	tmpl, ok := templates[resource.ObjectTemplate]
-	var err error
-	if !ok {
-		tmpl, err = template.New(resource.ObjectTemplate).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(resource.ObjectTemplate)
+	text := resource.ObjectTemplate
+	base, found := templates.Load(text)
+	if !found {
+		parsed, err := template.New(text).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(text)
 		if err != nil {
-			innerlog.Error(err, "unable to parse", "template", resource.ObjectTemplate)
+			innerlog.Error(err, "unable to parse", "template", text)
 			return nil, err
 		}
-		templates[resource.ObjectTemplate] = tmpl
+		// Concurrent first users may each parse the text; exactly one base is kept.
+		base, _ = templates.LoadOrStore(text, parsed)
 	}
-	return tmpl, nil
+	// text/template's Clone copies the function maps, so Funcs on the clone leaves the base alone;
+	// Funcs is documented as legal after parsing, to replace a function before execution.
+	bound, err := base.(*template.Template).Clone()
+	if err != nil {
+		innerlog.Error(err, "unable to clone", "template", text)
+		return nil, err
+	}
+	return bound.Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)), nil
 }
 
 // DefaultExcludedPaths represents paths that are exlcuded by default in all resources
