@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -421,8 +422,7 @@ func rule(resource, verb string) map[string]interface{} {
 
 // RBAC rules are an atomic list under server-side apply: the reconciler restores the whole list on
 // any drift and removes a dropped element. An exclusion INSIDE the list (".rules[0]") cannot be
-// honoured element by element: the list is released whole, then applied without that element,
-// which removes it; the previous merge-patch enforcer replaced the list the same way.
+// honoured element by element, so it excludes the list.
 func TestSSA_RulesAreAtomic(t *testing.T) {
 	needEnvtest(t)
 	cs := clientset(t)
@@ -448,11 +448,74 @@ func TestSSA_RulesAreAtomic(t *testing.T) {
 		t.Fatalf("a dropped element must be removed, got %v", got.Rules)
 	}
 
+	// An exclusion inside the atomic list excludes the list: set at creation, then released whole
+	// and never applied again, so both elements stay and nobody owns them.
 	partial := newReconciler(t, role("ssa-role-partial", []interface{}{rule("pods", "get"), rule("configmaps", "list")}), []string{".rules[0]"})
 	reconcileOnce(t, partial)
 	reconcileOnce(t, partial)
 	got, _ = cs.RbacV1().Roles("default").Get(context.Background(), "ssa-role-partial", metav1.GetOptions{})
-	if len(got.Rules) != 1 || got.Rules[0].Resources[0] != "configmaps" {
-		t.Fatalf("an exclusion inside an atomic list removes that element on the next reconcile (documented), got %v", got.Rules)
+	if len(got.Rules) != 2 {
+		t.Fatalf("an exclusion inside an atomic list must leave the whole list alone, got %v", got.Rules)
+	}
+	for _, e := range got.ManagedFields {
+		if e.Manager == FieldManager && e.FieldsV1 != nil && strings.Contains(string(e.FieldsV1.Raw), "f:rules") {
+			t.Fatalf("the reconciler must not own the released list, managedFields=%v", got.ManagedFields)
+		}
+	}
+}
+
+// An exclusion inside an atomic map: the server tracks nodeSelector as one unit, so the child
+// cannot be released alone. Measured in review before the widening: the reconciler kept owning
+// the map and the apply without the child deleted it. Now the map is the unit: set once, left alone.
+func TestSSA_ExcludedChildOfAtomicMapIsNotDeleted(t *testing.T) {
+	needEnvtest(t)
+	pod := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]interface{}{"name": "ssa-atomic-map", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"nodeSelector": map[string]interface{}{"disk": "ssd", "zone": "set-once"},
+			"containers":   []interface{}{map[string]interface{}{"name": "c", "image": "example.invalid/image"}},
+		},
+	}}
+	r := newReconciler(t, pod, []string{".spec.nodeSelector.zone"})
+	reconcileOnce(t, r)
+	reconcileOnce(t, r)
+	got, err := clientset(t).CoreV1().Pods("default").Get(context.Background(), "ssa-atomic-map", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.NodeSelector["zone"] != "set-once" || got.Spec.NodeSelector["disk"] != "ssd" {
+		t.Fatalf("the excluded child of an atomic map must survive, got %v", got.Spec.NodeSelector)
+	}
+	for _, e := range got.ManagedFields {
+		if e.Manager == FieldManager && e.FieldsV1 != nil && strings.Contains(string(e.FieldsV1.Raw), "f:nodeSelector") {
+			t.Fatalf("the reconciler must release the whole atomic map, managedFields=%v", got.ManagedFields)
+		}
+	}
+}
+
+// With no legacy manager named (the default), a client-side entry is left alone: the reconciler
+// takes only what it applies, and a field it does not render stays with its writer.
+func TestSSA_NoFoldByDefault(t *testing.T) {
+	needEnvtest(t)
+	if len(LegacyFieldManagers) != 0 {
+		t.Fatalf("the library must fold nothing unless the consumer names a manager, got %v", LegacyFieldManagers)
+	}
+	cs := clientset(t)
+	if _, err := cs.CoreV1().ConfigMaps("default").Create(context.Background(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ssa-nofold", Namespace: "default"},
+		Data:       map[string]string{"enforced": "one", "foreign": "must-survive"},
+	}, metav1.CreateOptions{FieldManager: "manager"}); err != nil {
+		t.Fatal(err)
+	}
+	r := newReconciler(t, configMap("ssa-nofold", map[string]string{"enforced": "two"}, nil), nil)
+	reconcileOnce(t, r)
+	cm := live(t, "ssa-nofold")
+	if cm.Data["foreign"] != "must-survive" || cm.Data["enforced"] != "two" {
+		t.Fatalf("without a fold the foreign field survives and the rendered one is enforced, got %v", cm.Data)
+	}
+	if ownedBy(t, cm, "manager", metav1.ManagedFieldsOperationUpdate) == nil {
+		t.Fatalf("the legacy entry must remain, managedFields=%v", cm.ManagedFields)
 	}
 }

@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/csaupgrade"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,30 +41,21 @@ import (
 var FieldManager = "lockedresourcecontroller"
 
 // LegacyFieldManagers names field managers whose client-side `Update` entries are folded into
-// FieldManager the first time this reconciler meets an object. Before it applied server-side, this
-// library created and patched objects through the manager's client, whose field manager is the
-// binary's name (the API server takes it from the user agent, up to the first "/"); on such an
-// object a field the template no longer renders is owned by that entry, and a plain apply would
-// never remove it. Measured on a live cluster: every object the operator had created carried one
-// entry, manager "manager", operation Update. A consumer with a different history sets this before
-// starting its managers; an empty list folds nothing.
+// FieldManager the first time this reconciler meets an object. Empty by default: nothing is folded.
 //
-// The fold takes the WHOLE entry of that name, so a field written under the same manager name by
-// a different actor (another controller whose binary is also called "manager", writing the very
-// object this reconciler locks) is folded too and removed by the apply if the template does not
-// render it. The previous enforcer's merge patch never removed a key, so that is new. It is
-// accepted: two controllers writing one locked object fight either way, and the alternative,
-// folding only what the template renders, leaves every stale field of a legacy object in place,
-// which is the failure this change exists to end.
-var LegacyFieldManagers = []string{legacyManagerFromUserAgent()}
-
-func legacyManagerFromUserAgent() string {
-	ua := rest.DefaultKubernetesUserAgent()
-	if i := strings.Index(ua, "/"); i > 0 {
-		return ua[:i]
-	}
-	return ua
-}
+// Before it applied server-side, this library created and patched objects through the manager's
+// client, whose field manager is the binary's name (the API server takes it from the user agent, up
+// to the first "/"); on such an object a field the template no longer renders is owned by that
+// entry, and a plain apply never removes it. A consumer that knows its history opts in before
+// starting its managers, for example []string{"manager"} (measured on a live cluster: every object
+// the operator had created carried one entry, manager "manager", operation Update).
+//
+// It is opt-in because the fold takes the WHOLE entry of that name: a field written under the same
+// name by a different actor (another controller whose binary is also called "manager", writing the
+// very object this reconciler locks) would be folded too and removed by the apply if the template
+// does not render it. The previous enforcer's merge patch never removed a key. Two controllers
+// writing one locked object fight either way, but that is the consumer's call, not the library's.
+var LegacyFieldManagers []string
 
 // LockedResourceReconciler is a reconciler that will lock down a resource to prevent changes from external events.
 // This reconciler can be configured to ignore a set of json path. Changed occurring on the ignored path will be ignored, and therefore allowed by the reconciler.
@@ -176,12 +166,17 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 		lor.log.Error(err, "unable to lookup", "object", lor.Resource)
 		return lor.manageErrorNoInstance(err)
 	}
-	instance, err = lor.releaseOwnership(ctx, client, instance)
+	excluded, err := lor.effectiveExcludedFieldPaths(instance)
+	if err != nil {
+		lor.log.Error(err, "unable to resolve", "excluded paths", lor.ExcludePaths, "for object", lor.Resource)
+		return lor.manageError(instance, err)
+	}
+	instance, err = lor.releaseOwnership(ctx, client, instance, excluded)
 	if err != nil {
 		lor.log.Error(err, "unable to release ownership of excluded paths", "object", lor.Resource)
 		return lor.manageError(instance, err)
 	}
-	desired, err := lor.desired()
+	desired, err := lor.desired(excluded)
 	if err != nil {
 		lor.log.Error(err, "unable to filter out", "excluded paths", lor.ExcludePaths, "from object", lor.Resource)
 		return lor.manageError(instance, err)
@@ -199,11 +194,20 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 	return lor.manageSuccess(applied)
 }
 
-// desired is what the reconciler applies after creation: the rendered object without its excluded
-// paths, so this manager never sends them, with the identity the apply needs restored in case an
-// exclusion covered it (".metadata" is a common one).
-func (lor *LockedResourceReconciler) desired() (*unstructured.Unstructured, error) {
-	desired, err := lockedresource.FilterOutPaths(&lor.Resource, lor.ExcludePaths)
+// desired is what the reconciler applies after creation: the rendered object without the excluded
+// units, so this manager never sends them, with the identity the apply needs restored in case an
+// exclusion covered it (".metadata" is a common one). The units are the effective ones (see
+// effectiveExcludedFieldPaths): sending a unit the reconciler just released would take it back.
+func (lor *LockedResourceReconciler) desired(excluded [][]string) (*unstructured.Unstructured, error) {
+	pointers := make([]string, 0, len(excluded))
+	for _, path := range excluded {
+		escaped := make([]string, len(path))
+		for i, segment := range path {
+			escaped[i] = strings.NewReplacer("~", "~0", "/", "~1").Replace(segment)
+		}
+		pointers = append(pointers, "/"+strings.Join(escaped, "/"))
+	}
+	desired, err := lockedresource.FilterOutPaths(&lor.Resource, pointers)
 	if err != nil {
 		return nil, err
 	}
@@ -236,14 +240,12 @@ func (lor *LockedResourceReconciler) apply(ctx context.Context, client dynamic.R
 // The patch replaces resourceVersion too, so a concurrent write makes it fail with a conflict and
 // the reconcile is retried against the newer object rather than overwriting its managed fields.
 // It returns the object the apply then races: the patched one, or live when nothing was sent.
-func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, client dynamic.ResourceInterface, live *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, client dynamic.ResourceInterface, live *unstructured.Unstructured, excluded [][]string) (*unstructured.Unstructured, error) {
 	upgraded := live.DeepCopy()
-	if err := csaupgrade.UpgradeManagedFields(upgraded, sets.New(LegacyFieldManagers...), FieldManager); err != nil {
-		return live, err
-	}
-	excluded, err := lor.excludedFieldPaths()
-	if err != nil {
-		return live, err
+	if len(LegacyFieldManagers) > 0 {
+		if err := csaupgrade.UpgradeManagedFields(upgraded, sets.New(LegacyFieldManagers...), FieldManager); err != nil {
+			return live, err
+		}
 	}
 	entries := upgraded.GetManagedFields()
 	for i := range entries {
@@ -292,9 +294,10 @@ func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, clien
 }
 
 // excludedFieldPaths converts the excluded paths into managedFields prefixes. An index stops the
-// prefix at the list: server-side apply owns a list whole (RBAC rules and subjects are atomic), so
-// one element cannot be released and the whole list is. A quoted key that looks like a number is
-// a key (measured in review: ".data['0']" released all of data before FieldPath said which is which).
+// prefix at the list: server-side apply owns a list without a map key whole (RBAC rules and
+// subjects), so one element cannot be released and the whole list is. A quoted key that looks like
+// a number is a key (measured in review: ".data['0']" released all of data before FieldPath said
+// which is which).
 func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 	out := make([][]string, 0, len(lor.ExcludePaths))
 	for _, jsonPath := range lor.ExcludePaths {
@@ -314,6 +317,69 @@ func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// effectiveExcludedFieldPaths widens each excluded path to the unit the server tracks ownership
+// of. managedFields is schema-shaped: a granular map (labels, a ConfigMap's data) lists its keys,
+// but an atomic map (a Pod's nodeSelector) and an atomic list (RBAC rules) are one member with no
+// children. An exclusion inside such a unit cannot be released on its own; releasing nothing and
+// then applying the unit without the excluded child would delete the child (measured in review).
+// So when no entry owns anything at or below the excluded path but one owns a strict ancestor, the
+// ancestor is the unit: released whole and left out of the apply, "set once" at that granularity.
+func (lor *LockedResourceReconciler) effectiveExcludedFieldPaths(live *unstructured.Unstructured) ([][]string, error) {
+	excluded, err := lor.excludedFieldPaths()
+	if err != nil {
+		return nil, err
+	}
+	var owned [][]string
+	for _, entry := range live.GetManagedFields() {
+		if entry.FieldsV1 == nil {
+			continue
+		}
+		set := fieldpath.NewSet()
+		if err := set.FromJSON(bytes.NewReader(entry.FieldsV1.Raw)); err != nil {
+			return nil, err
+		}
+		set.Iterate(func(p fieldpath.Path) {
+			names := make([]string, 0, len(p))
+			for _, element := range p {
+				if element.FieldName == nil {
+					return
+				}
+				names = append(names, *element.FieldName)
+			}
+			owned = append(owned, names)
+		})
+	}
+	for i, path := range excluded {
+		atOrBelow := false
+		var ancestor []string
+		for _, candidate := range owned {
+			if namesHavePrefix(candidate, path) {
+				atOrBelow = true
+				break
+			}
+			if len(candidate) < len(path) && namesHavePrefix(path, candidate) && len(candidate) > len(ancestor) {
+				ancestor = candidate
+			}
+		}
+		if !atOrBelow && ancestor != nil {
+			excluded[i] = ancestor
+		}
+	}
+	return excluded, nil
+}
+
+func namesHavePrefix(names, prefix []string) bool {
+	if len(names) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if names[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // withoutExcluded returns the members of set that are not under any excluded prefix.
