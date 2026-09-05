@@ -320,6 +320,10 @@ func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 // replaces the reconciler when it does), and live ownership is no evidence, because a unit this
 // reconciler released is owned by nobody afterwards and looks like nothing (measured in review: a
 // widening read off live ownership ratcheted a granular exclusion up to its parent map).
+//
+// The dry run goes through admission: a webhook that declares side effects rejects dry-run requests
+// ("does not support dry run"), and then this returns the error, the reconcile fails visibly and the
+// next one retries; nothing is applied and nothing is released while that lasts.
 func (lor *LockedResourceReconciler) ownershipUnits(ctx context.Context, client dynamic.ResourceInterface) ([][]string, error) {
 	if lor.units != nil {
 		return lor.units, nil

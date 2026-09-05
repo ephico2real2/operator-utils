@@ -73,7 +73,16 @@ subject is removed and a tampered label stays, set once; with `.metadata` remove
 tampered rendered label is restored and a foreign label kept; the dry-run apply passes the cluster's admission
 webhooks; every CR ReconcileSuccess.
 
-## Third opinion
+## Third pass (0a6d81b), Cursor
 
-A first-principles reviewer (Fable 5.1, experiments against envtest) was asked to break the same contract; its
-report and the decisions on it are recorded below when it lands.
+Every claim confirmed from source: the dry-run apply runs the same field-manager pipeline with persistence skipped;
+the unit rule yields the path for granular maps, the atomic parent for atomic maps and structs, the list for an
+index, and never widens past a childless member; the cache is populated only after the object exists and the
+enforcer restarts the reconciler on any key change; `RemoveNestedField` expresses every unit this code emits; a
+failing dry run leaves the cache empty and the reconcile retries. Two of the five review-driven tests were noted
+as not failing on the previous head (the map-keyed list and the fold-once tests): true, they document behaviour
+rather than fix it; kept as documentation. One operational fact recorded in the code: an admission webhook that
+declares side effects rejects dry-run requests, and then the reconcile fails visibly and retries.
+
+A first-principles reviewer (Fable 5.1) was also asked to break the contract with experiments; it was cut off by
+the session's rate limit before reporting.
