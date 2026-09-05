@@ -303,15 +303,24 @@ func TestFilterOutPaths_RootQuotedKey(t *testing.T) {
 	}
 }
 
-// FieldPath hands the excluded path to callers that search a managedFields set: unescaped
-// segments, indexes as written, unrooted and root-only paths as no-ops, malformed paths reported.
+// FieldPath hands the excluded path to callers that search a managedFields set: unescaped keys,
+// an index only where the path wrote one, unrooted and root-only paths as no-ops, malformed paths
+// reported. Measured in review before the Index flag: ".data['0']" was taken for a list index and
+// released all of data.
 func TestFieldPath(t *testing.T) {
-	cases := map[string][]string{
-		".spec.replicas":        {"spec", "replicas"},
-		"$.rules[0].verbs":      {"rules", "0", "verbs"},
-		`.data["x/y"]`:          {"data", "x/y"},
-		".data['a.b']":          {"data", "a.b"},
-		"/metadata/labels/a~1b": {"metadata", "labels", "a/b"},
+	key := func(n string) FieldSegment { return FieldSegment{Name: n} }
+	idx := func(n string) FieldSegment { return FieldSegment{Name: n, Index: true} }
+	cases := map[string][]FieldSegment{
+		".spec.replicas":        {key("spec"), key("replicas")},
+		"$.rules[0].verbs":      {key("rules"), idx("0"), key("verbs")},
+		".rules.0":              {key("rules"), idx("0")},
+		`.data["x/y"]`:          {key("data"), key("x/y")},
+		".data['a.b'].c":        {key("data"), key("a.b"), key("c")},
+		".data['0']":            {key("data"), key("0")},
+		`.data[""]`:             {key("data"), key("")},
+		".['root']":             {key("root")},
+		"/metadata/labels/a~1b": {key("metadata"), key("labels"), key("a/b")},
+		"/rules/0":              {key("rules"), idx("0")},
 		"spec.replicas":         nil,
 	}
 	for in, want := range cases {
@@ -324,7 +333,7 @@ func TestFieldPath(t *testing.T) {
 			t.Errorf("%q -> %v, want %v", in, got, want)
 		}
 	}
-	for _, in := range []string{".rules[-1]", ".data[", "$."} {
+	for _, in := range []string{".rules[-1]", ".data[", "$.", ".data[0]foo"} {
 		if _, err := FieldPath(in); err == nil {
 			t.Errorf("%q must be reported as malformed", in)
 		}

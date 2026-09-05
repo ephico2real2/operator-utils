@@ -188,20 +188,78 @@ func NormalizeJSONPaths(jsonPaths []string) []string {
 	return out
 }
 
-// FieldPath returns an excluded path as the unescaped segments of its RFC 6901 pointer, for a
-// caller that must find the path in a managedFields set rather than in a document. An index is
-// returned as written. An unrooted path, a no-op for FilterOutPaths, is a no-op here too (nil).
-func FieldPath(jsonPath string) ([]string, error) {
+// FieldSegment is one step of an excluded path for a caller that searches a managedFields set:
+// the key, unescaped, and whether the path wrote it as a list index. A quoted key is never an
+// index whatever it contains (".data['0']" names the key "0"); "[0]", a bare ".0" and a numeric
+// segment of an RFC 6901 pointer are.
+type FieldSegment struct {
+	Name  string
+	Index bool
+}
+
+// FieldPath returns an excluded path as its segments. An unrooted path, a no-op for FilterOutPaths,
+// is a no-op here too (nil); a malformed path is reported as it is there.
+func FieldPath(jsonPath string) ([]FieldSegment, error) {
 	if err := validatePath(jsonPath); err != nil {
 		return nil, err
 	}
-	pointer := getMergePathFromJSONPath(jsonPath)
-	if !strings.HasPrefix(pointer, "/") || pointer == "/" {
+	if strings.HasPrefix(jsonPath, "/") {
+		if jsonPath == "/" {
+			return nil, nil
+		}
+		var out []FieldSegment
+		for _, raw := range strings.Split(jsonPath[1:], "/") {
+			name := strings.NewReplacer("~1", "/", "~0", "~").Replace(raw)
+			out = append(out, FieldSegment{Name: name, Index: isNumeric(name)})
+		}
+		return out, nil
+	}
+	if !strings.HasPrefix(jsonPath, "$") && !strings.HasPrefix(jsonPath, ".") {
 		return nil, nil
 	}
-	segments := strings.Split(pointer[1:], "/")
-	for i, segment := range segments {
-		segments[i] = strings.NewReplacer("~1", "/", "~0", "~").Replace(segment)
+	rest := strings.TrimPrefix(jsonPath, "$")
+	var out []FieldSegment
+	for rest != "" {
+		switch {
+		case strings.HasPrefix(rest, "["):
+			m := indexedSegment.FindStringSubmatchIndex(rest)
+			if m == nil || m[0] != 0 {
+				return nil, fmt.Errorf("excluded path %q has a malformed bracket expression", jsonPath)
+			}
+			switch {
+			case m[2] >= 0:
+				out = append(out, FieldSegment{Name: rest[m[2]:m[3]], Index: true})
+			case m[4] >= 0:
+				out = append(out, FieldSegment{Name: rest[m[4]:m[5]]})
+			default:
+				out = append(out, FieldSegment{Name: rest[m[6]:m[7]]})
+			}
+			rest = rest[m[1]:]
+		case strings.HasPrefix(rest, "."):
+			rest = rest[1:]
+			end := strings.IndexAny(rest, ".[")
+			if end < 0 {
+				end = len(rest)
+			}
+			if name := rest[:end]; name != "" {
+				out = append(out, FieldSegment{Name: name, Index: isNumeric(name)})
+			}
+			rest = rest[end:]
+		default:
+			return nil, fmt.Errorf("excluded path %q: unexpected text %q", jsonPath, rest)
+		}
 	}
-	return segments, nil
+	return out, nil
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

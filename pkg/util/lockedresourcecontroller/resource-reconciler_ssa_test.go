@@ -341,3 +341,118 @@ func TestExcludedFieldPaths_IndexStopsAtTheList(t *testing.T) {
 		t.Fatal("a malformed excluded path must be reported")
 	}
 }
+
+// A quoted key that looks like a number is a key, not an index: excluding it must release exactly
+// that key. Measured in review: it used to release all of data.
+func TestExcludedFieldPaths_NumericQuotedKeyIsNotAnIndex(t *testing.T) {
+	r := &LockedResourceReconciler{ExcludePaths: []string{".data['0']", `.data["1"]`, ".rules[0]", ".rules.0.verbs"}}
+	got, err := r.excludedFieldPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"data", "0"}, {"data", "1"}, {"rules"}, {"rules"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestSSA_NumericQuotedDataKeyIsSetOnce(t *testing.T) {
+	needEnvtest(t)
+	r := newReconciler(t, configMap("ssa-numkey", map[string]string{"0": "from-template", "a": "1"}, nil), []string{".data['0']"})
+	reconcileOnce(t, r)
+	updateAs(t, "someone", func(cm *corev1.ConfigMap) { cm.Data["0"] = "theirs"; cm.Data["a"] = "drift" })("ssa-numkey")
+	reconcileOnce(t, r)
+	cm := live(t, "ssa-numkey")
+	if cm.Data["0"] != "theirs" || cm.Data["a"] != "1" {
+		t.Fatalf("the quoted numeric key is set once and its sibling enforced, got %v", cm.Data)
+	}
+	set := ownedBy(t, cm, FieldManager, metav1.ManagedFieldsOperationApply)
+	if owns(set, "data", "0") || !owns(set, "data", "a") {
+		t.Fatalf("the reconciler must own data.a and not data.0, managedFields=%v", cm.ManagedFields)
+	}
+}
+
+// A sink that keeps the messages, to check what the reconciler says about a reconcile.
+type memLog struct{ lines []string }
+
+func (m *memLog) Init(logr.RuntimeInfo)                    {}
+func (m *memLog) Enabled(int) bool                         { return true }
+func (m *memLog) Info(_ int, msg string, _ ...interface{}) { m.lines = append(m.lines, msg) }
+func (m *memLog) Error(error, string, ...interface{})      {}
+func (m *memLog) WithValues(...interface{}) logr.LogSink   { return m }
+func (m *memLog) WithName(string) logr.LogSink             { return m }
+
+// The "equal" verdict compares the apply's result with the object the apply raced, which is the
+// one the ownership release returned; measured in review: comparing with the first GET called a
+// release-then-no-op-apply "NOT equal".
+func TestSSA_EqualLogOnlyWhenApplyDoesNotWrite(t *testing.T) {
+	needEnvtest(t)
+	sink := &memLog{}
+	r := newReconciler(t, configMap("ssa-eqlog", map[string]string{"a": "1"}, map[string]string{"l": "v"}), []string{".metadata"})
+	r.log = logr.New(sink)
+	reconcileOnce(t, r) // creates
+	reconcileOnce(t, r) // releases the labels, then applies without them: nothing to write
+	var sawNotEqual, sawEqual bool
+	for _, line := range sink.lines {
+		switch line {
+		case "determined that resources are NOT equal; applied":
+			sawNotEqual = true
+		case "determined that resources are equal":
+			sawEqual = true
+		}
+	}
+	if sawNotEqual || !sawEqual {
+		t.Fatalf("a release followed by a no-op apply is 'equal'; lines=%v", sink.lines)
+	}
+}
+
+func role(name string, rules []interface{}) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "Role",
+		"metadata":   map[string]interface{}{"name": name, "namespace": "default"},
+		"rules":      rules,
+	}}
+}
+
+func rule(resource, verb string) map[string]interface{} {
+	return map[string]interface{}{"apiGroups": []interface{}{""}, "resources": []interface{}{resource}, "verbs": []interface{}{verb}}
+}
+
+// RBAC rules are an atomic list under server-side apply: the reconciler restores the whole list on
+// any drift and removes a dropped element. An exclusion INSIDE the list (".rules[0]") cannot be
+// honoured element by element: the list is released whole, then applied without that element,
+// which removes it; the previous merge-patch enforcer replaced the list the same way.
+func TestSSA_RulesAreAtomic(t *testing.T) {
+	needEnvtest(t)
+	cs := clientset(t)
+	r := newReconciler(t, role("ssa-role", []interface{}{rule("pods", "get"), rule("configmaps", "list")}), nil)
+	reconcileOnce(t, r)
+	got, err := cs.RbacV1().Roles("default").Get(context.Background(), "ssa-role", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Rules[1].Verbs = []string{"delete"}
+	if _, err := cs.RbacV1().Roles("default").Update(context.Background(), got, metav1.UpdateOptions{FieldManager: "someone"}); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, r)
+	got, _ = cs.RbacV1().Roles("default").Get(context.Background(), "ssa-role", metav1.GetOptions{})
+	if len(got.Rules) != 2 || got.Rules[1].Verbs[0] != "list" {
+		t.Fatalf("drift inside the list must be restored, got %v", got.Rules)
+	}
+	r.Resource = *role("ssa-role", []interface{}{rule("pods", "get")})
+	reconcileOnce(t, r)
+	got, _ = cs.RbacV1().Roles("default").Get(context.Background(), "ssa-role", metav1.GetOptions{})
+	if len(got.Rules) != 1 || got.Rules[0].Resources[0] != "pods" {
+		t.Fatalf("a dropped element must be removed, got %v", got.Rules)
+	}
+
+	partial := newReconciler(t, role("ssa-role-partial", []interface{}{rule("pods", "get"), rule("configmaps", "list")}), []string{".rules[0]"})
+	reconcileOnce(t, partial)
+	reconcileOnce(t, partial)
+	got, _ = cs.RbacV1().Roles("default").Get(context.Background(), "ssa-role-partial", metav1.GetOptions{})
+	if len(got.Rules) != 1 || got.Rules[0].Resources[0] != "configmaps" {
+		t.Fatalf("an exclusion inside an atomic list removes that element on the next reconcile (documented), got %v", got.Rules)
+	}
+}

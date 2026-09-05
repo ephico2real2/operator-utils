@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -50,6 +49,14 @@ var FieldManager = "lockedresourcecontroller"
 // never remove it. Measured on a live cluster: every object the operator had created carried one
 // entry, manager "manager", operation Update. A consumer with a different history sets this before
 // starting its managers; an empty list folds nothing.
+//
+// The fold takes the WHOLE entry of that name, so a field written under the same manager name by
+// a different actor (another controller whose binary is also called "manager", writing the very
+// object this reconciler locks) is folded too and removed by the apply if the template does not
+// render it. The previous enforcer's merge patch never removed a key, so that is new. It is
+// accepted: two controllers writing one locked object fight either way, and the alternative,
+// folding only what the template renders, leaves every stale field of a legacy object in place,
+// which is the failure this change exists to end.
 var LegacyFieldManagers = []string{legacyManagerFromUserAgent()}
 
 func legacyManagerFromUserAgent() string {
@@ -169,7 +176,8 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 		lor.log.Error(err, "unable to lookup", "object", lor.Resource)
 		return lor.manageErrorNoInstance(err)
 	}
-	if err := lor.releaseOwnership(ctx, client, instance); err != nil {
+	instance, err = lor.releaseOwnership(ctx, client, instance)
+	if err != nil {
 		lor.log.Error(err, "unable to release ownership of excluded paths", "object", lor.Resource)
 		return lor.manageError(instance, err)
 	}
@@ -227,14 +235,15 @@ func (lor *LockedResourceReconciler) apply(ctx context.Context, client dynamic.R
 //
 // The patch replaces resourceVersion too, so a concurrent write makes it fail with a conflict and
 // the reconcile is retried against the newer object rather than overwriting its managed fields.
-func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, client dynamic.ResourceInterface, live *unstructured.Unstructured) error {
+// It returns the object the apply then races: the patched one, or live when nothing was sent.
+func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, client dynamic.ResourceInterface, live *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	upgraded := live.DeepCopy()
 	if err := csaupgrade.UpgradeManagedFields(upgraded, sets.New(LegacyFieldManagers...), FieldManager); err != nil {
-		return err
+		return live, err
 	}
 	excluded, err := lor.excludedFieldPaths()
 	if err != nil {
-		return err
+		return live, err
 	}
 	entries := upgraded.GetManagedFields()
 	for i := range entries {
@@ -244,7 +253,7 @@ func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, clien
 		}
 		owned := fieldpath.NewSet()
 		if err := owned.FromJSON(bytes.NewReader(entry.FieldsV1.Raw)); err != nil {
-			return err
+			return live, err
 		}
 		kept := withoutExcluded(owned, excluded)
 		if kept.Size() == owned.Size() {
@@ -252,36 +261,40 @@ func (lor *LockedResourceReconciler) releaseOwnership(ctx context.Context, clien
 		}
 		raw, err := kept.ToJSON()
 		if err != nil {
-			return err
+			return live, err
 		}
 		entry.FieldsV1 = &v1.FieldsV1{Raw: raw}
 	}
 	before, err := json.Marshal(live.GetManagedFields())
 	if err != nil {
-		return err
+		return live, err
 	}
 	after, err := json.Marshal(entries)
 	if err != nil {
-		return err
+		return live, err
 	}
 	if bytes.Equal(before, after) {
-		return nil
+		return live, nil
 	}
 	patch, err := json.Marshal([]map[string]interface{}{
 		{"op": "replace", "path": "/metadata/managedFields", "value": entries},
 		{"op": "replace", "path": "/metadata/resourceVersion", "value": live.GetResourceVersion()},
 	})
 	if err != nil {
-		return err
+		return live, err
 	}
 	lor.log.V(1).Info("releasing ownership", "legacyManagers", LegacyFieldManagers, "excludedPaths", lor.ExcludePaths)
-	_, err = client.Patch(ctx, live.GetName(), types.JSONPatchType, patch, v1.PatchOptions{})
-	return err
+	patched, err := client.Patch(ctx, live.GetName(), types.JSONPatchType, patch, v1.PatchOptions{})
+	if err != nil {
+		return live, err
+	}
+	return patched, nil
 }
 
 // excludedFieldPaths converts the excluded paths into managedFields prefixes. An index stops the
 // prefix at the list: server-side apply owns a list whole (RBAC rules and subjects are atomic), so
-// one element cannot be released and the whole list is.
+// one element cannot be released and the whole list is. A quoted key that looks like a number is
+// a key (measured in review: ".data['0']" released all of data before FieldPath said which is which).
 func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 	out := make([][]string, 0, len(lor.ExcludePaths))
 	for _, jsonPath := range lor.ExcludePaths {
@@ -289,14 +302,15 @@ func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		for i, segment := range segments {
-			if _, err := strconv.Atoi(segment); err == nil {
-				segments = segments[:i]
+		names := make([]string, 0, len(segments))
+		for _, segment := range segments {
+			if segment.Index {
 				break
 			}
+			names = append(names, segment.Name)
 		}
-		if len(segments) > 0 {
-			out = append(out, segments)
+		if len(names) > 0 {
+			out = append(out, names)
 		}
 	}
 	return out, nil
