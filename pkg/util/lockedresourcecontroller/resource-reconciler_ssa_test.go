@@ -118,7 +118,12 @@ func live(t *testing.T, name string) *corev1.ConfigMap {
 
 func ownedBy(t *testing.T, cm *corev1.ConfigMap, manager string, op metav1.ManagedFieldsOperationType) *fieldpath.Set {
 	t.Helper()
-	for _, e := range cm.ManagedFields {
+	return ownedIn(t, cm.ManagedFields, manager, op)
+}
+
+func ownedIn(t *testing.T, entries []metav1.ManagedFieldsEntry, manager string, op metav1.ManagedFieldsOperationType) *fieldpath.Set {
+	t.Helper()
+	for _, e := range entries {
 		if e.Manager == manager && e.Operation == op && e.FieldsV1 != nil {
 			set := fieldpath.NewSet()
 			if err := set.FromJSON(bytes.NewReader(e.FieldsV1.Raw)); err != nil {
@@ -219,10 +224,17 @@ func TestSSA_ExcludedPathIsSetOnceThenLeftAlone(t *testing.T) {
 	if owns(ownedBy(t, cm, FieldManager, metav1.ManagedFieldsOperationApply), "data", "b") {
 		t.Fatalf("the reconciler must not own the excluded field, managedFields=%v", cm.ManagedFields)
 	}
-	// and a second reconcile, with nothing left to release, does not delete it either
+	// and later reconciles, with nothing left to release, neither delete it nor stop enforcing its
+	// sibling (measured in review: a widening read off live ownership released all of data here)
+	updateAs(t, "someone", func(cm *corev1.ConfigMap) { cm.Data["a"] = "drift-again" })("ssa-excluded")
 	reconcileOnce(t, r)
-	if got := live(t, "ssa-excluded").Data["b"]; got != "theirs" {
-		t.Fatalf("an excluded field must survive every reconcile, got %q", got)
+	reconcileOnce(t, r)
+	cm = live(t, "ssa-excluded")
+	if cm.Data["b"] != "theirs" || cm.Data["a"] != "1" {
+		t.Fatalf("an excluded field survives every reconcile and its sibling stays enforced, got %v", cm.Data)
+	}
+	if !owns(ownedBy(t, cm, FieldManager, metav1.ManagedFieldsOperationApply), "data", "a") {
+		t.Fatalf("the reconciler must keep owning data.a, managedFields=%v", cm.ManagedFields)
 	}
 }
 
@@ -282,6 +294,11 @@ func TestSSA_LegacyClientSideEntryIsFolded(t *testing.T) {
 	set := ownedBy(t, cm, FieldManager, metav1.ManagedFieldsOperationApply)
 	if !owns(set, "data", "a") || owns(set, "metadata", "labels") {
 		t.Fatalf("after the fold the reconciler owns the rendered data and not the excluded metadata, got %v", set)
+	}
+	// the fold happens once: the next reconcile has nothing to release and nothing to apply
+	reconcileOnce(t, r)
+	if got := live(t, "ssa-legacy").ResourceVersion; got != cm.ResourceVersion {
+		t.Fatalf("the second reconcile after a fold must write nothing: resourceVersion %s -> %s", cm.ResourceVersion, got)
 	}
 }
 
@@ -481,6 +498,11 @@ func TestSSA_ExcludedChildOfAtomicMapIsNotDeleted(t *testing.T) {
 	r := newReconciler(t, pod, []string{".spec.nodeSelector.zone"})
 	reconcileOnce(t, r)
 	reconcileOnce(t, r)
+	// a restarted operator: a fresh reconciler with no memory, on an object whose map nobody owns
+	// any more; it must learn the unit again rather than send the map without its excluded child
+	fresh := newReconciler(t, pod, []string{".spec.nodeSelector.zone"})
+	reconcileOnce(t, fresh)
+	reconcileOnce(t, fresh)
 	got, err := clientset(t).CoreV1().Pods("default").Get(context.Background(), "ssa-atomic-map", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -517,5 +539,61 @@ func TestSSA_NoFoldByDefault(t *testing.T) {
 	}
 	if ownedBy(t, cm, "manager", metav1.ManagedFieldsOperationUpdate) == nil {
 		t.Fatalf("the legacy entry must remain, managedFields=%v", cm.ManagedFields)
+	}
+}
+
+// A ConfigMap key that looks like a negative index: excluding it must round-trip (measured in
+// review: the reduced object was built through a pointer that rejected "/data/-1").
+func TestSSA_NegativeLookingKeyIsSetOnce(t *testing.T) {
+	needEnvtest(t)
+	r := newReconciler(t, configMap("ssa-negkey", map[string]string{"-1": "from-template", "a": "1"}, nil), []string{".data['-1']"})
+	reconcileOnce(t, r)
+	updateAs(t, "someone", func(cm *corev1.ConfigMap) { cm.Data["-1"] = "theirs"; cm.Data["a"] = "drift" })("ssa-negkey")
+	reconcileOnce(t, r)
+	cm := live(t, "ssa-negkey")
+	if cm.Data["-1"] != "theirs" || cm.Data["a"] != "1" {
+		t.Fatalf("the key is set once and its sibling enforced, got %v", cm.Data)
+	}
+}
+
+// An index into a map-keyed list (Deployment containers) releases the whole list: the unit the
+// path names cannot be expressed without the list's merge key, so the list is set once. Documented.
+func TestSSA_IndexIntoMapKeyedListReleasesTheList(t *testing.T) {
+	needEnvtest(t)
+	container := func(name, image string) map[string]interface{} {
+		return map[string]interface{}{"name": name, "image": image}
+	}
+	dep := func(images ...string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "apps/v1",
+			"kind":       "Deployment",
+			"metadata":   map[string]interface{}{"name": "ssa-maplist", "namespace": "default"},
+			"spec": map[string]interface{}{
+				"replicas": int64(1),
+				"selector": map[string]interface{}{"matchLabels": map[string]interface{}{"app": "x"}},
+				"template": map[string]interface{}{
+					"metadata": map[string]interface{}{"labels": map[string]interface{}{"app": "x"}},
+					"spec":     map[string]interface{}{"containers": []interface{}{container("keep", images[0]), container("free", images[1])}},
+				},
+			},
+		}}
+	}
+	r := newReconciler(t, dep("example.invalid/keep:1", "example.invalid/free:1"), []string{".spec.template.spec.containers[1].image"})
+	reconcileOnce(t, r)
+	reconcileOnce(t, r)
+	got, err := clientset(t).AppsV1().Deployments("default").Get(context.Background(), "ssa-maplist", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("the list is set once, nothing deleted, got %v", got.Spec.Template.Spec.Containers)
+	}
+	for _, e := range got.ManagedFields {
+		if e.Manager == FieldManager && e.FieldsV1 != nil && strings.Contains(string(e.FieldsV1.Raw), "f:containers") {
+			t.Fatalf("the whole list must be released, managedFields=%v", got.ManagedFields)
+		}
+	}
+	if !owns(ownedIn(t, got.ManagedFields, FieldManager, metav1.ManagedFieldsOperationApply), "spec", "replicas") {
+		t.Fatalf("fields outside the list stay owned, managedFields=%v", got.ManagedFields)
 	}
 }

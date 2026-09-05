@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -76,6 +75,7 @@ type LockedResourceReconciler struct {
 	parentObject   client.Object
 	firstReconcile chan event.GenericEvent
 	log            logr.Logger
+	units          [][]string // see ownershipUnits
 }
 
 // NewLockedObjectReconciler returns a new reconcile.Reconciler
@@ -166,7 +166,7 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 		lor.log.Error(err, "unable to lookup", "object", lor.Resource)
 		return lor.manageErrorNoInstance(err)
 	}
-	excluded, err := lor.effectiveExcludedFieldPaths(instance)
+	excluded, err := lor.ownershipUnits(ctx, client)
 	if err != nil {
 		lor.log.Error(err, "unable to resolve", "excluded paths", lor.ExcludePaths, "for object", lor.Resource)
 		return lor.manageError(instance, err)
@@ -176,14 +176,9 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 		lor.log.Error(err, "unable to release ownership of excluded paths", "object", lor.Resource)
 		return lor.manageError(instance, err)
 	}
-	desired, err := lor.desired(excluded)
+	applied, err := lor.apply(ctx, client, lor.desired(excluded))
 	if err != nil {
-		lor.log.Error(err, "unable to filter out", "excluded paths", lor.ExcludePaths, "from object", lor.Resource)
-		return lor.manageError(instance, err)
-	}
-	applied, err := lor.apply(ctx, client, desired)
-	if err != nil {
-		lor.log.Error(err, "unable to apply", "object", desired)
+		lor.log.Error(err, "unable to apply", "object", lor.Resource)
 		return lor.manageError(instance, err)
 	}
 	if applied.GetResourceVersion() == instance.GetResourceVersion() {
@@ -196,35 +191,28 @@ func (lor *LockedResourceReconciler) Reconcile(ctx context.Context, request reco
 
 // desired is what the reconciler applies after creation: the rendered object without the excluded
 // units, so this manager never sends them, with the identity the apply needs restored in case an
-// exclusion covered it (".metadata" is a common one). The units are the effective ones (see
-// effectiveExcludedFieldPaths): sending a unit the reconciler just released would take it back.
-func (lor *LockedResourceReconciler) desired(excluded [][]string) (*unstructured.Unstructured, error) {
-	pointers := make([]string, 0, len(excluded))
-	for _, path := range excluded {
-		escaped := make([]string, len(path))
-		for i, segment := range path {
-			escaped[i] = strings.NewReplacer("~", "~0", "/", "~1").Replace(segment)
-		}
-		pointers = append(pointers, "/"+strings.Join(escaped, "/"))
-	}
-	desired, err := lockedresource.FilterOutPaths(&lor.Resource, pointers)
-	if err != nil {
-		return nil, err
+// exclusion covered it (".metadata" is a common one). The units are removed by name, not through a
+// JSON pointer: a unit is a chain of map keys, and a key such as "-1" or "0" would be read as an
+// index on the way back through a pointer (measured in review).
+func (lor *LockedResourceReconciler) desired(units [][]string) *unstructured.Unstructured {
+	desired := lor.Resource.DeepCopy()
+	for _, unit := range units {
+		unstructured.RemoveNestedField(desired.Object, unit...)
 	}
 	desired.SetAPIVersion(lor.Resource.GetAPIVersion())
 	desired.SetKind(lor.Resource.GetKind())
 	desired.SetName(lor.Resource.GetName())
 	desired.SetNamespace(lor.Resource.GetNamespace())
-	return desired, nil
+	return desired
 }
 
-func (lor *LockedResourceReconciler) apply(ctx context.Context, client dynamic.ResourceInterface, obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+func (lor *LockedResourceReconciler) apply(ctx context.Context, client dynamic.ResourceInterface, obj *unstructured.Unstructured, dryRun ...string) (*unstructured.Unstructured, error) {
 	data, err := json.Marshal(obj.Object)
 	if err != nil {
 		return nil, err
 	}
 	force := true
-	return client.Patch(ctx, obj.GetName(), types.ApplyPatchType, data, v1.PatchOptions{FieldManager: FieldManager, Force: &force})
+	return client.Patch(ctx, obj.GetName(), types.ApplyPatchType, data, v1.PatchOptions{FieldManager: FieldManager, Force: &force, DryRun: dryRun})
 }
 
 // releaseOwnership rewrites this manager's entry in the live object's managedFields before the
@@ -319,21 +307,38 @@ func (lor *LockedResourceReconciler) excludedFieldPaths() ([][]string, error) {
 	return out, nil
 }
 
-// effectiveExcludedFieldPaths widens each excluded path to the unit the server tracks ownership
-// of. managedFields is schema-shaped: a granular map (labels, a ConfigMap's data) lists its keys,
-// but an atomic map (a Pod's nodeSelector) and an atomic list (RBAC rules) are one member with no
-// children. An exclusion inside such a unit cannot be released on its own; releasing nothing and
-// then applying the unit without the excluded child would delete the child (measured in review).
-// So when no entry owns anything at or below the excluded path but one owns a strict ancestor, the
-// ancestor is the unit: released whole and left out of the apply, "set once" at that granularity.
-func (lor *LockedResourceReconciler) effectiveExcludedFieldPaths(live *unstructured.Unstructured) ([][]string, error) {
+// ownershipUnits resolves each excluded path to the unit the server tracks ownership of. The
+// evidence is the server's own answer for the rendered object: a dry-run apply of the whole object
+// returns the managedFields it would record for this manager, and that set is schema-shaped. A
+// granular map (labels, a ConfigMap's data) lists its keys; an atomic map (a Pod's nodeSelector) or
+// a list is one member with no children. An exclusion inside such a unit cannot be released on its
+// own, and applying the unit without the excluded child would delete the child (measured in review),
+// so the unit is the deepest owned ancestor when that ancestor has no children: released whole and
+// left out of the apply, "set once" at that granularity. A key in a granular map is its own unit.
+//
+// Computed once per reconciler: the rendered object does not change for its lifetime (the enforcer
+// replaces the reconciler when it does), and live ownership is no evidence, because a unit this
+// reconciler released is owned by nobody afterwards and looks like nothing (measured in review: a
+// widening read off live ownership ratcheted a granular exclusion up to its parent map).
+func (lor *LockedResourceReconciler) ownershipUnits(ctx context.Context, client dynamic.ResourceInterface) ([][]string, error) {
+	if lor.units != nil {
+		return lor.units, nil
+	}
 	excluded, err := lor.excludedFieldPaths()
 	if err != nil {
 		return nil, err
 	}
+	if len(excluded) == 0 {
+		lor.units = [][]string{}
+		return lor.units, nil
+	}
+	probe, err := lor.apply(ctx, client, lor.Resource.DeepCopy(), v1.DryRunAll)
+	if err != nil {
+		return nil, err
+	}
 	var owned [][]string
-	for _, entry := range live.GetManagedFields() {
-		if entry.FieldsV1 == nil {
+	for _, entry := range probe.GetManagedFields() {
+		if entry.Manager != FieldManager || entry.Operation != v1.ManagedFieldsOperationApply || entry.FieldsV1 == nil {
 			continue
 		}
 		set := fieldpath.NewSet()
@@ -351,23 +356,31 @@ func (lor *LockedResourceReconciler) effectiveExcludedFieldPaths(live *unstructu
 			owned = append(owned, names)
 		})
 	}
-	for i, path := range excluded {
-		atOrBelow := false
-		var ancestor []string
+	units := make([][]string, 0, len(excluded))
+	for _, path := range excluded {
+		var deepest []string
 		for _, candidate := range owned {
-			if namesHavePrefix(candidate, path) {
-				atOrBelow = true
-				break
-			}
-			if len(candidate) < len(path) && namesHavePrefix(path, candidate) && len(candidate) > len(ancestor) {
-				ancestor = candidate
+			if len(candidate) <= len(path) && namesHavePrefix(path, candidate) && len(candidate) > len(deepest) {
+				deepest = candidate
 			}
 		}
-		if !atOrBelow && ancestor != nil {
-			excluded[i] = ancestor
+		unit := path
+		if deepest != nil && len(deepest) < len(path) {
+			leaf := true
+			for _, candidate := range owned {
+				if len(candidate) > len(deepest) && namesHavePrefix(candidate, deepest) {
+					leaf = false
+					break
+				}
+			}
+			if leaf {
+				unit = deepest
+			}
 		}
+		units = append(units, unit)
 	}
-	return excluded, nil
+	lor.units = units
+	return units, nil
 }
 
 func namesHavePrefix(names, prefix []string) bool {
