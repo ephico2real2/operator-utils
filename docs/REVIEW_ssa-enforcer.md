@@ -52,5 +52,28 @@ foreign label left alone.
 
 ## Second pass (f86b9a8)
 
-Pending: the widening (a map-keyed list such as Deployment containers), the pointer round-trip of `desired`,
-the opt-in fold, `FieldPath`'s grammar.
+Cursor and Codex again traced without a process; every runtime claim was measured here against envtest and on
+the live cluster with the operator build (commit 0a6d81b carries the fixes).
+
+| Claim | Cursor | Codex | Decision |
+|---|---|---|---|
+| C1 widening is correct and minimal | REFUTED | PLAUSIBLE (same reasoning) | **Accepted, the most important finding of the pass, both reviewers**: the widening read live ownership as if it were schema. After a granular exclusion was released, its parent (a member because of the `.` marker) looked like an atomic ancestor and the next reconcile widened to the whole map: a ConfigMap's `data` stopped being enforced. And after an atomic map was released, nothing recorded that it was atomic, so a later reconcile, or a restarted operator, would send the map without its excluded child and the server would delete the child. Fix: the unit of each excluded path is learned from a dry-run apply of the whole rendered object (the managedFields the server would record, schema-shaped: a granular map lists its keys, an atomic map or list is one childless member), the deepest owned ancestor when it has no children, else the path itself; computed once per reconciler. Measured: the granular sibling stays enforced through further reconciles; the atomic map survives a fresh reconciler with no memory. An index into a map-keyed list (Deployment containers) still releases the whole list, because the merge key is schema the reconciler does not have; documented and measured (nothing deleted, fields outside the list stay owned). Cursor's index-to-key resolution rejected: it needs the merge key |
+| C2 `desired` round-trips every pointer | REFUTED | CONFIRMED | **Accepted (Cursor)**: a ConfigMap key named `-1` was rejected on the way back through a pointer as a negative index. The reduced object is now built by deleting units by name; no pointer round trip exists. Measured with a key `-1` set once and its sibling enforced |
+| C3 creation sets once; no window | CONFIRMED (race) | REFUTED (third reconcile) | **Accepted in Codex's form**: same root cause as C1, same fix; the documented cost (a non-excluded sibling inside a released unit is no longer enforced) is stated on `ownershipUnits` |
+| C4 `GetKey` restarts without deleting | CONFIRMED | CONFIRMED | — (deletion keys on group, kind, namespace, name; the restart passes `deleteResources=false`) |
+| C5 the fold is opt-in and happens once | CONFIRMED | PLAUSIBLE | **Measured**: the second reconcile after a fold writes nothing (resourceVersion unchanged); test added |
+| C6 `FieldPath` grammar | CONFIRMED | CONFIRMED | `/data/0` in pointer form is an index and releases all of `data`: use the dotted or quoted form for a numeric key; documented |
+
+**Volunteered by Codex, recorded, no change:** `StoppableManager.Stop` cancels and returns without waiting for
+in-flight reconciles, so a restart may briefly run the old and new reconcilers together under one manager name.
+Upstream behaviour, unchanged by this branch; the two converge on the same object.
+
+**Live, with the operator build against 0a6d81b:** with `.metadata` excluded (the chart's CRs today) a hand-added
+subject is removed and a tampered label stays, set once; with `.metadata` removed from a NamespaceConfig a
+tampered rendered label is restored and a foreign label kept; the dry-run apply passes the cluster's admission
+webhooks; every CR ReconcileSuccess.
+
+## Third opinion
+
+A first-principles reviewer (Fable 5.1, experiments against envtest) was asked to break the same contract; its
+report and the decisions on it are recorded below when it lands.
