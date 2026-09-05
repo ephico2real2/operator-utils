@@ -1,6 +1,10 @@
 package lockedresource
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -70,56 +74,104 @@ func TestFilterOutPaths_IndexedPathRemovesTheRightElement(t *testing.T) {
 
 // The parse cache is shared by every controller in the process; it must survive concurrent use and
 // must not hand a template parsed with one rest config to a caller with another.
-func TestGetTemplate_ConcurrentAndKeyedByConfig(t *testing.T) {
-	templates = sync.Map{} // the cache is process-global; count only what this test inserts
-	cfgA, cfgB := &rest.Config{Host: "https://a"}, &rest.Config{Host: "https://b"}
-	texts := []string{"a: 1\n", "b: 2\n", "c: {{ .Name }}\n", "d: 4\n"}
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		for _, text := range texts {
-			for _, cfg := range []*rest.Config{cfgA, cfgB, nil} {
-				wg.Add(1)
-				go func(text string, cfg *rest.Config) {
-					defer wg.Done()
-					if _, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, cfg, innerlog); err != nil {
-						t.Errorf("getTemplate: %v", err)
-					}
-				}(text, cfg)
-			}
-		}
+// lookupTransport answers the two requests `lookup "v1" "ConfigMap"` makes (discovery of v1, then
+// the object) and labels the object with the identity of the transport that served it.
+type lookupTransport struct{ source string }
+
+func (tr lookupTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body string
+	switch req.URL.Path {
+	case "/api/v1":
+		body = `{"apiVersion":"v1","kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"configmaps","singularName":"configmap","namespaced":true,"kind":"ConfigMap","verbs":["get","list"]}]}`
+	case "/api/v1/namespaces/ns/configmaps/name":
+		body = fmt.Sprintf(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"name","namespace":"ns","labels":{"source":%q}}}`, tr.source)
+	default:
+		return nil, fmt.Errorf("unexpected request %s", req.URL.Path)
 	}
+	return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+}
+
+// One parsed base per template text, and every caller executes with ITS config. Measured in review
+// on the material-keyed cache: 32 configs that differed only in their transport shared one key, so
+// whichever caller parsed first supplied everyone's lookup.
+func TestGetTemplate_OneBasePerText_EachCallerBoundToItsConfig(t *testing.T) {
+	templates = sync.Map{}
+	const text = `{{ index (index (index (lookup "v1" "ConfigMap" "ns" "name") "metadata") "labels") "source" }}`
+	const callers = 32
+	type result struct {
+		want, got string
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		source := fmt.Sprintf("config-%02d", i)
+		config := &rest.Config{Host: "https://same.invalid", Transport: lookupTransport{source: source}}
+		wg.Add(1)
+		go func(want string, config *rest.Config) {
+			defer wg.Done()
+			<-start
+			tmpl, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, config, innerlog)
+			if err != nil {
+				results <- result{want: want, err: err}
+				return
+			}
+			var out bytes.Buffer
+			err = tmpl.Execute(&out, nil)
+			results <- result{want: want, got: out.String(), err: err}
+		}(source, config)
+	}
+	close(start)
 	wg.Wait()
-	a, _ := templates.Load(templateKey{text: texts[0], configKey: restConfigCacheKey(cfgA)})
-	b, _ := templates.Load(templateKey{text: texts[0], configKey: restConfigCacheKey(cfgB)})
-	if a == nil || b == nil || a.(*template.Template) == b.(*template.Template) {
-		t.Errorf("the same text must be cached separately per rest config")
+	close(results)
+	for r := range results {
+		if r.err != nil {
+			t.Errorf("%s: %v", r.want, r.err)
+			continue
+		}
+		if r.got != r.want {
+			t.Errorf("a caller executed with another caller's config: got %q, want %q", r.got, r.want)
+		}
 	}
 	entries := 0
 	templates.Range(func(_, _ any) bool { entries++; return true })
-	if entries != len(texts)*3 {
-		t.Errorf("expected %d cache entries (texts x configs), got %d", len(texts)*3, entries)
+	if entries != 1 {
+		t.Errorf("expected one cached base for one text, got %d", entries)
 	}
 }
 
-// A caller that builds a fresh *rest.Config per call (rest.CopyConfig, a literal) must not add a
-// cache entry per call: the key is the config's material, not its address.
-func TestGetTemplate_KeyIsConfigMaterialNotPointer(t *testing.T) {
+// Fresh config values per call (rest.CopyConfig, a literal) and a nil config all share the one base;
+// each call gets its own clone, so the base is never handed out.
+func TestGetTemplate_FreshConfigsShareOneBase(t *testing.T) {
 	templates = sync.Map{}
 	const text = "kind: ConfigMap\n"
+	seen := map[*template.Template]bool{}
 	for i := 0; i < 50; i++ {
-		if _, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, &rest.Config{Host: "https://same"}, innerlog); err != nil {
+		tmpl, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, &rest.Config{Host: "https://same"}, innerlog)
+		if err != nil {
 			t.Fatal(err)
 		}
+		seen[tmpl] = true
 	}
-	for i := 0; i < 2; i++ {
-		if _, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, nil, innerlog); err != nil {
-			t.Fatal(err)
-		}
+	if tmpl, err := getTemplate(&utilsapi.LockedResourceTemplate{ObjectTemplate: text}, nil, innerlog); err != nil {
+		t.Fatal(err)
+	} else {
+		seen[tmpl] = true
 	}
 	entries := 0
-	templates.Range(func(_, _ any) bool { entries++; return true })
-	if entries != 2 {
-		t.Errorf("expected one entry for the identical configs and one for nil, got %d", entries)
+	templates.Range(func(_, v any) bool {
+		entries++
+		if seen[v.(*template.Template)] {
+			t.Error("the cached base must never be returned to a caller")
+		}
+		return true
+	})
+	if entries != 1 {
+		t.Errorf("expected one cache entry for one text, got %d", entries)
+	}
+	if len(seen) != 51 {
+		t.Errorf("expected a private clone per call, got %d distinct templates", len(seen))
 	}
 }
 
@@ -168,9 +220,9 @@ func TestGetMergePathFromJSONPath_UnrootedStaysUnrooted(t *testing.T) {
 // "data" and ".data[" removed nothing, both silently (measured in review).
 func TestFilterOutPaths_MalformedPathIsAnError(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"key": "value", "a.b": "dotted"}}}
-	for _, path := range []string{".data.", ".data[", ".data[]", ".data..key", "$.data[key]", ".data['a.b'].", ".data[0"} {
+	for _, path := range []string{".data.", ".data[", ".data[]", ".data..key", "$.data[key]", ".data['a.b'].", ".data[0", ".data[0]foo", ".data['foo']bar", "$.", ".", "$", "", ".data['it\\'s']"} {
 		_, err := FilterOutPaths(obj, []string{path})
-		if err == nil || !(strings.Contains(err.Error(), "malformed bracket") || strings.Contains(err.Error(), "empty segment")) {
+		if err == nil || !(strings.Contains(err.Error(), "malformed bracket") || strings.Contains(err.Error(), "empty segment") || strings.Contains(err.Error(), "names no field")) {
 			t.Errorf("%q must be reported as malformed, got %v", path, err)
 		}
 	}
@@ -184,5 +236,69 @@ func TestFilterOutPaths_MalformedPathIsAnError(t *testing.T) {
 		if data := out.Object["data"].(map[string]interface{}); len(data) != 1 {
 			t.Errorf("%q must remove exactly one key, got %v", path, data)
 		}
+	}
+}
+
+// An RFC 6901 pointer is passed through untouched. Measured in review before this: "/data/a.b" was
+// converted to "/data/a/b", the nested path, and the dotted key survived.
+func TestFilterOutPaths_PointerInputIsNotConverted(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"a.b": "dotted", "a": map[string]interface{}{"b": "nested"}, "[x]": "bracketed"}}}
+	for _, path := range []string{"/data/a.b", "/data/[x]"} {
+		if got := getMergePathFromJSONPath(path); got != path {
+			t.Errorf("%q must pass through, got %q", path, got)
+		}
+	}
+	out, err := FilterOutPaths(obj, []string{"/data/a.b", "/data/[x]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := out.Object["data"].(map[string]interface{})
+	if _, ok := data["a.b"]; ok {
+		t.Errorf("the dotted key must be removed, got %v", data)
+	}
+	if _, ok := data["[x]"]; ok {
+		t.Errorf("the bracketed key must be removed, got %v", data)
+	}
+	if data["a"].(map[string]interface{})["b"] != "nested" {
+		t.Errorf("the nested path must be untouched, got %v", data)
+	}
+	if _, err := FilterOutPaths(obj, []string{"/data/-1"}); err == nil || !strings.Contains(err.Error(), "negative index") {
+		t.Errorf("a negative segment in pointer form is an index, got %v", err)
+	}
+}
+
+// An empty quoted key names the key ""; it is well formed. At 84aa264 the trailing-dot trim turned
+// it into the parent and removed all of "data" (both reviewers, second pass).
+func TestFilterOutPaths_EmptyQuotedKey(t *testing.T) {
+	for _, path := range []string{".data['']", `.data[""]`} {
+		if got := getMergePathFromJSONPath(path); got != "/data/" {
+			t.Errorf("%q must be the empty pointer token, got %q", path, got)
+		}
+		obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "data": map[string]interface{}{"": "empty", "keep": "k"}}}
+		out, err := FilterOutPaths(obj, []string{path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, ok := out.Object["data"].(map[string]interface{})
+		if !ok || len(data) != 1 || data["keep"] != "k" {
+			t.Errorf("%q must remove only the empty key, got %v", path, out.Object["data"])
+		}
+	}
+}
+
+// A quoted key at the root: ".['root']" became "//root" and matched nothing (volunteered in review).
+func TestFilterOutPaths_RootQuotedKey(t *testing.T) {
+	for _, path := range []string{".['root']", "$['root']", `$["root"]`} {
+		if got := getMergePathFromJSONPath(path); got != "/root" {
+			t.Errorf("%q must be /root, got %q", path, got)
+		}
+	}
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{"kind": "ConfigMap", "root": "v", "keep": "k"}}
+	out, err := FilterOutPaths(obj, []string{".['root']"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out.Object["root"]; ok || out.Object["keep"] != "k" {
+		t.Errorf("must remove root and keep the rest, got %v", out.Object)
 	}
 }

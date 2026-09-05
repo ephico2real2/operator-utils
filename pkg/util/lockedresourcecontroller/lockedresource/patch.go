@@ -95,15 +95,33 @@ var negativeIndex = regexp.MustCompile(`\[\s*-\d+\s*\]|(?:^|[./])-\d+(?:[./\[]|$
 // validatePath reports an excluded path that cannot name a fixed location:
 //   - a negative index: json-patch would count it from the end and report an out-of-range one with
 //     the same text as a past-the-end index, so it would be silently ignored;
-//   - a bracket that is not a complete [n], ['key'] or ["key"] expression;
-//   - an empty segment (a trailing dot, or two dots in a row).
+//   - a bracket that is not a complete [n], ['key'] or ["key"] expression, or one glued to text
+//     (".data[0]foo" would become "/data/0foo" and match nothing);
+//   - an empty segment (a trailing dot, or two dots in a row), or a path that names only the root.
 //
 // Measured in review before these checks: ".data[" removed nothing, silently, and ".data." removed
 // all of "data" because a trailing dot was trimmed. A typo in an excluded path must be reported, not
-// retargeted. A quoted key that merely looks like a negative index (".data['-1']") is a key. The lone
-// root path "." (or "$") is left alone; json-patch rejects it on its own.
+// retargeted. A quoted key is data, whatever it contains, so ".data['-1']" is a key; a key that
+// contains one kind of quote is written with the other kind. An RFC 6901 pointer ("/data/a.b") is
+// passed through untouched, dots and brackets in its segments included; in that form a segment
+// that is a negative number is taken for an index.
 func validatePath(jsonPath string) error {
-	unquoted := quotedSegment.ReplaceAllString(strings.TrimPrefix(jsonPath, "$"), "")
+	if strings.HasPrefix(jsonPath, "/") {
+		if negativeIndex.MatchString(jsonPath) {
+			return fmt.Errorf("excluded path %q has a negative index; indexes count from 0", jsonPath)
+		}
+		return nil
+	}
+	path := strings.TrimPrefix(jsonPath, "$")
+	if strings.TrimSpace(path) == "" || path == "." {
+		return fmt.Errorf("excluded path %q names no field", jsonPath)
+	}
+	for _, loc := range indexedSegment.FindAllStringIndex(path, -1) {
+		if end := loc[1]; end < len(path) && path[end] != '.' && path[end] != '[' {
+			return fmt.Errorf("excluded path %q has a malformed bracket expression; use [n], ['key'] or [\"key\"]", jsonPath)
+		}
+	}
+	unquoted := quotedSegment.ReplaceAllString(path, "")
 	if negativeIndex.MatchString(unquoted) {
 		return fmt.Errorf("excluded path %q has a negative index; indexes count from 0", jsonPath)
 	}
@@ -111,7 +129,9 @@ func validatePath(jsonPath string) error {
 	if strings.ContainsAny(stripped, "[]") {
 		return fmt.Errorf("excluded path %q has a malformed bracket expression; use [n], ['key'] or [\"key\"]", jsonPath)
 	}
-	if len(stripped) > 1 && (strings.HasSuffix(stripped, ".") || strings.Contains(stripped, "..")) {
+	// The root dot is not a segment: ".['root']" strips to "." and is well formed.
+	stripped = strings.TrimPrefix(stripped, ".")
+	if strings.HasSuffix(stripped, ".") || strings.Contains(stripped, "..") {
 		return fmt.Errorf("excluded path %q has an empty segment", jsonPath)
 	}
 	return nil
@@ -127,6 +147,10 @@ func getMergePathFromJSONPath(jsonPath string) string {
 	// unrooted "spec.replicas" produced "spec/replicas", which json-patch treated as a no-op; keeping
 	// that (rather than silently turning it into "/spec/replicas") preserves what existing callers
 	// observed. The rooted spelling is the documented one.
+	if strings.HasPrefix(jsonPath, "/") {
+		// Already a pointer: converting its dots would retarget "/data/a.b" to "/data/a/b".
+		return jsonPath
+	}
 	rooted := strings.HasPrefix(jsonPath, "$") || strings.HasPrefix(jsonPath, ".")
 	jsonPath = strings.TrimPrefix(jsonPath, "$")
 	// [n] and ['key'] / ["key"] become dotted segments; a bracketed key may itself contain dots or
@@ -143,6 +167,8 @@ func getMergePathFromJSONPath(jsonPath string) string {
 		}
 		return "." + seg
 	})
+	// ".['root']" is now "..root"; without this trim it would become "//root" and match nothing.
+	jsonPath = strings.TrimPrefix(jsonPath, ".")
 	pointer := strings.ReplaceAll(jsonPath, ".", "/")
 	if rooted && !strings.HasPrefix(pointer, "/") {
 		pointer = "/" + pointer

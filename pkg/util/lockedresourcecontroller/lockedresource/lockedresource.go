@@ -3,7 +3,6 @@ package lockedresource
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"text/template"
 
@@ -71,38 +70,15 @@ func GetLockedResources(resources []utilsapi.LockedResource) ([]LockedResource, 
 	return lockedResources, nil
 }
 
-// templates caches parsed templates. It is read and written from every controller that renders
-// through this package, concurrently, so it must be a sync.Map: the plain map it replaced was a
-// data race and, under load at operator start, a fatal "concurrent map writes". The key includes
-// the rest config, because the FuncMap (the lookup function in particular) is bound at parse time;
-// a text parsed once with one config must not be served to a caller with another.
-var templates sync.Map
-
-type templateKey struct {
-	text      string
-	configKey string
-}
-
-// restConfigCacheKey identifies a rest config by the material that changes what `lookup` would
-// see, not by pointer: callers that build or copy a config per reconcile would otherwise add an
-// entry per call and grow the cache without bound (measured: 50 calls, 50 entries).
-func restConfigCacheKey(config *rest.Config) string {
-	if config == nil {
-		return ""
-	}
-	return strings.Join([]string{
-		config.Host,
-		config.APIPath,
-		config.Username,
-		config.BearerToken,
-		config.BearerTokenFile,
-		string(config.CAData),
-		config.CAFile,
-		string(config.CertData),
-		config.CertFile,
-		config.Impersonate.UserName,
-	}, "\x00")
-}
+// templates caches parsed templates by text. It is read and written from every controller that
+// renders through this package, concurrently, so it must be a sync.Map: the plain map it replaced
+// was a data race and, under load at operator start, a fatal "concurrent map writes". A cached
+// entry is a parsed base that is never executed: the FuncMap (lookup in particular) closes over a
+// rest config, so getTemplate clones the base and rebinds the caller's functions on every call.
+// Keying the cache by config material was tried and shown incomplete in review: Password, TLS
+// settings, impersonation groups, exec and auth providers, proxy and transport all reach lookup
+// and cannot all be fingerprinted, and a pointer key grew one entry per copied config.
+var templates sync.Map // map[string]*template.Template
 
 // GetLockedResourcesFromTemplates Keep backwards compatability with existing consumers
 func GetLockedResourcesFromTemplates(resources []utilsapi.LockedResourceTemplate, params interface{}) ([]LockedResource, error) {
@@ -138,18 +114,25 @@ func GetLockedResourcesFromTemplatesWithRestConfig(resources []utilsapi.LockedRe
 }
 
 func getTemplate(resource *utilsapi.LockedResourceTemplate, config *rest.Config, logger logr.Logger) (*template.Template, error) {
-	key := templateKey{text: resource.ObjectTemplate, configKey: restConfigCacheKey(config)}
-	if cached, ok := templates.Load(key); ok {
-		return cached.(*template.Template), nil
+	text := resource.ObjectTemplate
+	base, found := templates.Load(text)
+	if !found {
+		parsed, err := template.New(text).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(text)
+		if err != nil {
+			innerlog.Error(err, "unable to parse", "template", text)
+			return nil, err
+		}
+		// Concurrent first users may each parse the text; exactly one base is kept.
+		base, _ = templates.LoadOrStore(text, parsed)
 	}
-	tmpl, err := template.New(resource.ObjectTemplate).Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)).Parse(resource.ObjectTemplate)
+	// text/template's Clone copies the function maps, so Funcs on the clone leaves the base alone;
+	// Funcs is documented as legal after parsing, to replace a function before execution.
+	bound, err := base.(*template.Template).Clone()
 	if err != nil {
-		innerlog.Error(err, "unable to parse", "template", resource.ObjectTemplate)
+		innerlog.Error(err, "unable to clone", "template", text)
 		return nil, err
 	}
-	// Two goroutines may parse the same text at once; both results are equivalent, keep the first.
-	actual, _ := templates.LoadOrStore(key, tmpl)
-	return actual.(*template.Template), nil
+	return bound.Funcs(utilstemplates.AdvancedTemplateFuncMap(config, logger)), nil
 }
 
 // DefaultExcludedPaths represents paths that are exlcuded by default in all resources
